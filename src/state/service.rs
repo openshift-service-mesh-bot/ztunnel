@@ -104,6 +104,20 @@ impl EndpointSet {
         self.inner.insert(k, Arc::new(v));
     }
 
+    pub fn extend(&mut self, eps: impl IntoIterator<Item = (Strng, Endpoint)>) {
+        for (k, v) in eps {
+            self.inner.insert(k, Arc::new(v));
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn contains(&self, key: &Strng) -> bool {
         self.inner.contains_key(key)
     }
@@ -112,8 +126,8 @@ impl EndpointSet {
         self.inner.get(key).map(Arc::as_ref)
     }
 
-    pub fn remove(&mut self, key: &Strng) {
-        self.inner.remove(key);
+    pub fn remove(&mut self, key: &Strng) -> bool {
+        self.inner.remove(key).is_some()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Endpoint> {
@@ -369,6 +383,12 @@ pub struct ServiceStore {
     /// service for a given hostname. However, `ServiceEntry` allows hostnames to be overridden
     /// on a per-namespace basis.
     pub(super) by_host: HashMap<Strng, Vec<Arc<Service>>>,
+
+    /// Counts endpoint-only reindexes (one per service per [Self::apply_endpoints]
+    /// that mutates an existing service). Used by tests to assert that a push
+    /// clones each service at most once, not once per endpoint.
+    #[cfg(test)]
+    endpoint_reindexes: usize,
 }
 
 impl ServiceStore {
@@ -471,62 +491,61 @@ impl ServiceStore {
     }
 
     /// Adds an endpoint for the service VIP.
-    pub fn insert_endpoint(&mut self, service_name: NamespacedHostname, ep: Endpoint) {
-        let ep_uid = ep.workload_uid.clone();
-        if let Some(svc) = self.get_by_namespaced_host(&service_name) {
-            // We may or may not accept the endpoint based on it's health
-            if !svc.should_include_endpoint(ep.status) {
-                trace!(
-                    "service doesn't accept pod with status {:?}, skip",
-                    ep.status
-                );
-                return;
-            }
+    /// Applies a batch of endpoint upserts and removals to a single service with
+    /// a single clone + single reindex (or a single staged-map update when the
+    /// service has not been received yet). The xDS push handler uses this to
+    /// coalesce all of a service's endpoint changes in one push, avoiding the
+    /// O(E²) cost of cloning the service's whole [EndpointSet] per endpoint.
+    ///
+    /// Removals are applied before upserts, so a uid present in both (a
+    /// re-inserted workload) reflects the upsert — or, if the upsert is
+    /// health-filtered out, is correctly left removed.
+    pub fn apply_endpoints(
+        &mut self,
+        service_name: &NamespacedHostname,
+        upserts: HashMap<Strng, Endpoint>,
+        removals: HashSet<Strng>,
+    ) {
+        if let Some(svc) = self.get_by_namespaced_host(service_name) {
             let mut svc = Arc::unwrap_or_clone(svc);
+            let mut changed = false;
 
-            // Clone the service and add the endpoint.
-            svc.endpoints.insert(ep_uid, ep);
+            for uid in &removals {
+                changed |= svc.endpoints.remove(uid);
+            }
 
-            // Update the service.
-            self.insert_endpoint_update(svc);
+            // We may or may not accept an endpoint based on its health.
+            let accepted: Vec<(Strng, Endpoint)> = upserts
+                .into_iter()
+                .filter(|(_, ep)| svc.should_include_endpoint(ep.status))
+                .collect();
+            if !accepted.is_empty() {
+                changed = true;
+                svc.endpoints.extend(accepted);
+            }
+
+            // Single reindex for the whole batch.
+            if changed {
+                self.insert_endpoint_update(svc);
+            }
         } else {
             // We received workload endpoints, but don't have the Service yet.
-            // This can happen due to ordering issues.
-            trace!("pod has service {}, but service not found", service_name);
-
-            // Add a staged entry. This will be added to the service once we receive it.
-            self.staged_services
-                .entry(service_name.clone())
-                .or_default()
-                .insert(ep_uid, ep.clone());
-        }
-    }
-
-    /// Removes entries for the given endpoint address.
-    pub fn remove_endpoint(&mut self, prev_workload: &Workload) {
-        let mut services_to_update = HashSet::new();
-        let workload_uid = &prev_workload.uid;
-        for svc in prev_workload.services.iter() {
-            // Remove the endpoint from the staged services.
-            self.staged_services
-                .entry(svc.clone())
-                .or_default()
-                .remove(workload_uid);
-            if self.staged_services[svc].is_empty() {
-                self.staged_services.remove(svc);
+            // This can happen due to ordering issues. Stage them; they are
+            // health-filtered at flush time (see insert_internal). Apply removals
+            // before upserts, matching the present-service path.
+            if !removals.is_empty()
+                && let Some(staged) = self.staged_services.get_mut(service_name)
+            {
+                staged.retain(|uid, _| !removals.contains(uid));
+                if staged.is_empty() {
+                    self.staged_services.remove(service_name);
+                }
             }
-
-            services_to_update.insert(svc.clone());
-        }
-
-        // Now remove the endpoint from all Services.
-        for svc in &services_to_update {
-            if let Some(svc) = self.get_by_namespaced_host(svc) {
-                let mut svc = Arc::unwrap_or_clone(svc);
-                svc.endpoints.remove(workload_uid);
-
-                // Update the service.
-                self.insert_endpoint_update(svc);
+            if !upserts.is_empty() {
+                self.staged_services
+                    .entry(service_name.clone())
+                    .or_default()
+                    .extend(upserts);
             }
         }
     }
@@ -542,6 +561,10 @@ impl ServiceStore {
     }
 
     fn insert_internal(&mut self, mut service: Service, endpoint_update_only: bool) {
+        #[cfg(test)]
+        if endpoint_update_only {
+            self.endpoint_reindexes += 1;
+        }
         let namespaced_hostname = service.namespaced_hostname();
         // If we're replacing an existing service, remove the old one from all data structures.
         if !endpoint_update_only {
@@ -675,6 +698,11 @@ impl ServiceStore {
     pub fn num_staged_services(&self) -> usize {
         self.staged_services.len()
     }
+
+    #[cfg(test)]
+    pub fn endpoint_reindexes(&self) -> usize {
+        self.endpoint_reindexes
+    }
 }
 
 /// Ranking for a CIDR-VIP match. Ordered lexicographically over
@@ -798,6 +826,21 @@ mod tests {
 
     fn ip6(segments: [u16; 8]) -> IpAddr {
         IpAddr::V6(Ipv6Addr::from(segments))
+    }
+
+    fn nshost(name: &str, ns: &str) -> NamespacedHostname {
+        NamespacedHostname {
+            namespace: ns.into(),
+            hostname: format!("{name}.{ns}.svc.cluster.local").into(),
+        }
+    }
+
+    fn endpoint(uid: &str, status: HealthStatus) -> Endpoint {
+        Endpoint {
+            workload_uid: uid.into(),
+            port: HashMap::new(),
+            status,
+        }
     }
 
     #[test]
@@ -1247,5 +1290,130 @@ mod tests {
             .get_best_by_vip(&nw(ip(10, 0, 1, 5)), Some(&ns_other))
             .unwrap();
         assert_eq!(svc.name, "local");
+    }
+
+    // Endpoints arriving before their service are staged, not reindexed, until the
+    // service materializes; on flush the unhealthy one is filtered out.
+    #[test]
+    fn apply_endpoints_stages_and_filters_on_flush() {
+        let mut store = ServiceStore::default();
+        let host = nshost("svc", "ns");
+
+        let mut upserts = HashMap::new();
+        upserts.insert(
+            "ep-healthy".into(),
+            endpoint("ep-healthy", HealthStatus::Healthy),
+        );
+        upserts.insert(
+            "ep-unhealthy".into(),
+            endpoint("ep-unhealthy", HealthStatus::Unhealthy),
+        );
+        store.apply_endpoints(&host, upserts, HashSet::new());
+
+        // Staged, not applied: no service exists yet, so nothing is reindexed.
+        assert_eq!(store.num_staged_services(), 1);
+        assert_eq!(store.endpoint_reindexes(), 0);
+        assert!(store.get_by_namespaced_host(&host).is_none());
+
+        // Once the service arrives, staged endpoints are flushed and the unhealthy
+        // one is filtered out.
+        store.insert(make_service("svc", "ns", vec![ip(10, 0, 0, 1)], vec![]));
+        assert_eq!(store.num_staged_services(), 0);
+        let svc = store.get_by_namespaced_host(&host).unwrap();
+        assert_eq!(svc.endpoints.len(), 1);
+        assert!(svc.endpoints.contains(&"ep-healthy".into()));
+        assert!(!svc.endpoints.contains(&"ep-unhealthy".into()));
+    }
+
+    // Removals against staged (not-yet-received) services: pruning an entry keeps
+    // the service key staged, emptying the staged map drops the key, and a removal
+    // with nothing staged is a no-op (no panic, no empty entry created).
+    #[test]
+    fn apply_endpoints_staged_removals() {
+        let mut store = ServiceStore::default();
+        let host = nshost("svc", "ns");
+
+        let mut upserts = HashMap::new();
+        upserts.insert("ep1".into(), endpoint("ep1", HealthStatus::Healthy));
+        upserts.insert("ep2".into(), endpoint("ep2", HealthStatus::Healthy));
+        store.apply_endpoints(&host, upserts, HashSet::new());
+        assert_eq!(store.num_staged_services(), 1);
+
+        // Remove one of two staged endpoints: the service key remains staged.
+        store.apply_endpoints(&host, HashMap::new(), HashSet::from(["ep1".into()]));
+        assert_eq!(store.num_staged_services(), 1);
+
+        // Removing the last staged endpoint drops the staged service entirely.
+        store.apply_endpoints(&host, HashMap::new(), HashSet::from(["ep2".into()]));
+        assert_eq!(store.num_staged_services(), 0);
+
+        // Removing again with nothing staged is a no-op: no empty entry created.
+        store.apply_endpoints(&host, HashMap::new(), HashSet::from(["missing".into()]));
+        assert_eq!(store.num_staged_services(), 0);
+        assert_eq!(store.endpoint_reindexes(), 0);
+    }
+
+    // A workload going unhealthy on re-insertion (same uid in both the removal and
+    // the upsert) must still evict its previously-healthy endpoint.
+    #[test]
+    fn apply_endpoints_present_unhealthy_reinsert_evicts() {
+        let mut store = ServiceStore::default();
+        let host = nshost("svc", "ns");
+
+        // Service present, with a healthy endpoint already applied.
+        store.insert(make_service("svc", "ns", vec![ip(10, 0, 0, 1)], vec![]));
+        let mut upserts = HashMap::new();
+        upserts.insert("ep1".into(), endpoint("ep1", HealthStatus::Healthy));
+        store.apply_endpoints(&host, upserts, HashSet::new());
+        assert_eq!(store.endpoint_reindexes(), 1);
+        assert!(
+            store
+                .get_by_namespaced_host(&host)
+                .unwrap()
+                .endpoints
+                .contains(&"ep1".into())
+        );
+
+        // Re-insertion of the same uid, now unhealthy: the removal drops the stale
+        // endpoint and the unhealthy upsert is filtered out, so ep1 disappears.
+        let mut upserts = HashMap::new();
+        upserts.insert("ep1".into(), endpoint("ep1", HealthStatus::Unhealthy));
+        store.apply_endpoints(&host, upserts, HashSet::from(["ep1".into()]));
+        assert_eq!(store.endpoint_reindexes(), 2);
+        let svc = store.get_by_namespaced_host(&host).unwrap();
+        assert_eq!(svc.endpoints.len(), 0);
+        assert!(!svc.endpoints.contains(&"ep1".into()));
+    }
+
+    // A healthy re-upsert of an already-present uid (same uid in both the removal and the upsert) must
+    // leave the new endpoint in place.
+    #[test]
+    fn apply_endpoints_present_removal_applied_before_upsert() {
+        let mut store = ServiceStore::default();
+        let host = nshost("svc", "ns");
+
+        // Service present, with the original endpoint (port 80 -> 8080).
+        store.insert(make_service("svc", "ns", vec![ip(10, 0, 0, 1)], vec![]));
+        let mut old = endpoint("ep1", HealthStatus::Healthy);
+        old.port = HashMap::from([(80, 8080)]);
+        store.apply_endpoints(&host, HashMap::from([("ep1".into(), old)]), HashSet::new());
+
+        // Same uid removed and re-upserted (healthy) in one batch, now port 90 -> 9090.
+        let mut new = endpoint("ep1", HealthStatus::Healthy);
+        new.port = HashMap::from([(90, 9090)]);
+        store.apply_endpoints(
+            &host,
+            HashMap::from([("ep1".into(), new)]),
+            HashSet::from(["ep1".into()]),
+        );
+
+        // The new endpoint survives (not deleted by its own removal) and reflects
+        // the upsert, not the stale port mapping.
+        let svc = store.get_by_namespaced_host(&host).unwrap();
+        assert_eq!(svc.endpoints.len(), 1);
+        assert_eq!(
+            svc.endpoints.get(&"ep1".into()).unwrap().port,
+            HashMap::from([(90, 9090)])
+        );
     }
 }
