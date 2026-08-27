@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+mod profiler;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::future::Future;
@@ -27,7 +28,7 @@ use criterion::{
     BenchmarkGroup, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use pprof::criterion::{Output, PProfProfiler};
+use profiler::{Output, PProfProfiler};
 use prometheus_client::registry::Registry;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -35,7 +36,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use ztunnel::rbac::{Authorization, RbacMatch, StringMatch};
-use ztunnel::state::workload::{Protocol, Workload};
+use ztunnel::state::workload::{InboundProtocol, Workload};
 use ztunnel::state::{DemandProxyState, ProxyRbacContext, ProxyState};
 use ztunnel::test_helpers::app::{DestinationAddr, TestApp};
 use ztunnel::test_helpers::linux::{TestMode, WorkloadManager};
@@ -54,7 +55,7 @@ const N_RULES: usize = 10;
 const N_POLICIES: usize = 10_000;
 const DUMMY_NETWORK: &str = "198.51.100.0/24";
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn initialize_namespace_tests() {
     ztunnel::test_helpers::namespaced::initialize_namespace_tests();
 }
@@ -94,6 +95,7 @@ fn create_test_policies() -> Vec<Authorization> {
             scope: ztunnel::rbac::RbacScope::Global,
             namespace: "default".into(),
             rules: rules.clone(),
+            dry_run: false,
         });
     }
 
@@ -457,11 +459,11 @@ fn hbone_connection_config() -> ztunnel::config::ConfigSource {
         let lwl = LocalWorkload {
             workload: Workload {
                 workload_ips: vec![hbone_connection_ip(i)],
-                protocol: Protocol::HBONE,
-                uid: strng::format!("cluster1//v1/Pod/default/remote{}", i),
-                name: strng::format!("workload-{}", i),
-                namespace: strng::format!("namespace-{}", i),
-                service_account: strng::format!("service-account-{}", i),
+                protocol: InboundProtocol::HBONE,
+                uid: strng::format!("cluster1//v1/Pod/default/remote{i}"),
+                name: strng::format!("workload-{i}"),
+                namespace: strng::format!("namespace-{i}"),
+                service_account: strng::format!("service-account-{i}"),
                 ..test_helpers::test_default_workload()
             },
             services: Default::default(),
@@ -471,7 +473,7 @@ fn hbone_connection_config() -> ztunnel::config::ConfigSource {
     let lwl = LocalWorkload {
         workload: Workload {
             workload_ips: vec![],
-            protocol: Protocol::HBONE,
+            protocol: InboundProtocol::HBONE,
             uid: "cluster1//v1/Pod/default/local-source".into(),
             name: "local-source".into(),
             namespace: "default".into(),

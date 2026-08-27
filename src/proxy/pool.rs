@@ -29,6 +29,7 @@ use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tracing::{Instrument, debug, trace};
 
+use crate::baggage::Baggage;
 use crate::config;
 
 use flurry;
@@ -73,6 +74,8 @@ struct ConnSpawner {
     socket_factory: Arc<dyn SocketFactory + Send + Sync>,
     local_workload: Arc<LocalWorkloadInformation>,
     timeout_rx: watch::Receiver<bool>,
+    crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    metrics: Arc<crate::proxy::Metrics>,
 }
 
 // Does nothing but spawn new conns when asked
@@ -81,7 +84,7 @@ impl ConnSpawner {
         debug!("spawning new pool conn for {}", key);
 
         let cert = self.local_workload.fetch_certificate().await?;
-        let connector = cert.outbound_connector(key.dst_id.clone())?;
+        let connector = cert.outbound_connector(key.dst_id.clone(), self.crl_manager.clone())?;
         let tcp_stream = super::freebind_connect(None, key.dst, self.socket_factory.as_ref())
             .await
             .map_err(|e: io::Error| match e.kind() {
@@ -89,13 +92,34 @@ impl ConnSpawner {
                 _ => e.into(),
             })?;
 
-        let tls_stream = connector.connect(tcp_stream).await?;
+        let tls_stream = connector.connect(tcp_stream).await.inspect_err(|e| {
+            if crate::tls::io_error_is_cert_revoked(e) {
+                self.metrics
+                    .record_crl_rejection(crate::proxy::metrics::Reporter::source);
+            }
+        })?;
         trace!("connector connected, handshaking");
+        // Enforce CRL revocation on this tunnel for its whole lifetime
+        let revocation = self.crl_manager.as_ref().map(|crl_manager| {
+            let (_, ssl) = tls_stream.get_ref();
+            let peer_identity = {
+                let x509_cert = crate::tls::certificate_from_connection(ssl);
+                crate::tls::identity(&x509_cert)
+            };
+            crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
+                ssl,
+                peer_identity,
+                cert.root_store(),
+                webpki::KeyUsage::server_auth(),
+                crate::proxy::metrics::Reporter::source,
+            ))
+        });
         let sender = h2::client::spawn_connection(
             self.cfg.clone(),
             tls_stream,
             self.timeout_rx.clone(),
             key,
+            revocation,
         )
         .await?;
         Ok(sender)
@@ -140,7 +164,7 @@ impl PoolState {
             async move {
                 debug!("starting an idle timeout for connection {:?}", pool_key_ref);
                 pool_ref
-                    .idle_timeout(&pool_key_ref, release_timeout, evict, rx, pickup)
+                    .idle_timeout(&pool_key_ref, Some(release_timeout), evict, rx, pickup)
                     .await;
                 debug!(
                     "connection {:?} was removed/checked out/timed out of the pool",
@@ -337,6 +361,8 @@ impl WorkloadHBONEPool {
         cfg: Arc<crate::config::Config>,
         socket_factory: Arc<dyn SocketFactory + Send + Sync>,
         local_workload: Arc<LocalWorkloadInformation>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+        metrics: Arc<crate::proxy::Metrics>,
     ) -> WorkloadHBONEPool {
         let (timeout_tx, timeout_rx) = watch::channel(false);
         let (timeout_send, timeout_recv) = watch::channel(false);
@@ -347,6 +373,8 @@ impl WorkloadHBONEPool {
             socket_factory,
             local_workload,
             timeout_rx: timeout_recv.clone(),
+            crl_manager,
+            metrics,
         };
 
         Self {
@@ -370,10 +398,13 @@ impl WorkloadHBONEPool {
         &mut self,
         workload_key: &WorkloadKey,
         request: http::Request<()>,
-    ) -> Result<H2Stream, Error> {
+    ) -> Result<(H2Stream, Option<Baggage>, Option<watch::Receiver<bool>>), Error> {
         let mut connection = self.connect(workload_key).await?;
 
-        connection.send_request(request).await
+        // Surface the tunnel's revocation signal so the caller can attribute a revoked teardown.
+        let revoked = connection.revoked_receiver();
+        let (stream, baggage) = connection.send_request(request).await?;
+        Ok((stream, baggage, revoked))
     }
 
     // Obtain a pooled connection. Will prefer to retrieve an existing conn from the pool, but
@@ -525,6 +556,7 @@ mod test {
     use std::sync::RwLock;
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -536,6 +568,8 @@ mod test {
     use crate::test_helpers::helpers::initialize_telemetry;
 
     use crate::identity::Identity;
+
+    use self::h2::TokioH2Stream;
 
     use super::*;
     use crate::drain::DrainWatcher;
@@ -588,6 +622,50 @@ mod test {
         // Once we drop the pool, we should drop the connections as well
         drop(pool);
         assert_opens_drops!(srv, 1, 1);
+    }
+
+    /// This is really a test for TokioH2Stream, but its nicer here because we have access to
+    /// streams.
+    /// Most important, we make sure there are no panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_buffering() {
+        let (mut pool, srv) = setup_test(3).await;
+
+        let key = key(&srv, 2);
+        let req = || {
+            http::Request::builder()
+                .uri(srv.addr.to_string())
+                .method(http::Method::CONNECT)
+                .version(http::Version::HTTP_2)
+                .body(())
+                .unwrap()
+        };
+
+        let (c, _baggage, _) = pool.send_request_pooled(&key.clone(), req()).await.unwrap();
+        let mut c = TokioH2Stream::new(c);
+        c.write_all(b"abcde").await.unwrap();
+        let mut b = [0u8; 100];
+        // Properly buffer reads and don't error
+        assert_eq!(c.read(&mut b).await.unwrap(), 8);
+        assert_eq!(&b[..8], b"poolsrv\n"); // this is added by itself
+        assert_eq!(c.read(&mut b[..1]).await.unwrap(), 1);
+        assert_eq!(&b[..1], b"a");
+        assert_eq!(c.read(&mut b[..1]).await.unwrap(), 1);
+        assert_eq!(&b[..1], b"b");
+        assert_eq!(c.read(&mut b[..1]).await.unwrap(), 1);
+        assert_eq!(&b[..1], b"c");
+        assert_eq!(c.read(&mut b).await.unwrap(), 2); // there are only two bytes left
+        assert_eq!(&b[..2], b"de");
+
+        // Once we drop the pool, we should still retained the buffered data,
+        // but then we should error.
+        c.write_all(b"abcde").await.unwrap();
+        assert_eq!(c.read(&mut b[..3]).await.unwrap(), 3);
+        assert_eq!(&b[..3], b"abc");
+        drop(pool);
+        assert_eq!(c.read(&mut b[..2]).await.unwrap(), 2);
+        assert_eq!(&b[..2], b"de");
+        assert!(c.read(&mut b).await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -980,7 +1058,13 @@ mod test {
             mock_proxy_state,
             identity::mock::new_secret_manager(Duration::from_secs(10)),
         ));
-        let pool = WorkloadHBONEPool::new(Arc::new(cfg), sock_fact, local_workload);
+        let pool = WorkloadHBONEPool::new(
+            Arc::new(cfg),
+            sock_fact,
+            local_workload,
+            None,
+            Arc::new(crate::proxy::Metrics::new(&mut Registry::default())),
+        );
         let server = TestServer {
             conn_counter,
             drop_rx,

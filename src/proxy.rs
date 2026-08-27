@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
 
-use hickory_proto::error::ProtoError;
+use hickory_proto::ProtoError;
 
 use crate::strng::Strng;
 use rand::Rng;
@@ -48,8 +48,9 @@ use crate::state::{DemandProxyState, WorkloadInfo};
 use crate::{config, identity, socket, tls};
 
 pub mod connection_manager;
+pub mod inbound;
+
 mod h2;
-mod inbound;
 mod inbound_passthrough;
 #[allow(non_camel_case_types)]
 pub mod metrics;
@@ -114,19 +115,16 @@ impl DefaultSocketFactory {
                 .with_time(cfg.keepalive_time)
                 .with_retries(cfg.keepalive_retries)
                 .with_interval(cfg.keepalive_interval);
-            tracing::trace!(
-                "set keepalive: {:?}",
-                socket2::SockRef::from(&s).set_tcp_keepalive(&ka)
-            );
+            let res = socket2::SockRef::from(&s).set_tcp_keepalive(&ka);
+            tracing::trace!("set keepalive: {:?}", res);
         }
+        #[cfg(target_os = "linux")]
         if cfg.user_timeout_enabled {
             // https://blog.cloudflare.com/when-tcp-sockets-refuse-to-die/
             // TCP_USER_TIMEOUT = TCP_KEEPIDLE + TCP_KEEPINTVL * TCP_KEEPCNT.
             let ut = cfg.keepalive_time + cfg.keepalive_retries * cfg.keepalive_interval;
-            tracing::trace!(
-                "set user timeout: {:?}",
-                socket2::SockRef::from(&s).set_tcp_user_timeout(Some(ut))
-            );
+            let res = socket2::SockRef::from(&s).set_tcp_user_timeout(Some(ut));
+            tracing::trace!("set user timeout: {:?}", res);
         }
         Ok(())
     }
@@ -259,6 +257,9 @@ pub(super) struct ProxyInputs {
     socket_factory: Arc<dyn SocketFactory + Send + Sync>,
     local_workload_information: Arc<LocalWorkloadInformation>,
     resolver: Option<Arc<dyn Resolver + Send + Sync>>,
+    // If true, inbound connections created with these inputs will not attempt to preserve the original source IP.
+    pub disable_inbound_freebind: bool,
+    pub(super) crl_manager: Option<Arc<tls::crl::CrlManager>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -271,6 +272,8 @@ impl ProxyInputs {
         socket_factory: Arc<dyn SocketFactory + Send + Sync>,
         resolver: Option<Arc<dyn Resolver + Send + Sync>>,
         local_workload_information: Arc<LocalWorkloadInformation>,
+        disable_inbound_freebind: bool,
+        crl_manager: Option<Arc<tls::crl::CrlManager>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
@@ -280,6 +283,8 @@ impl ProxyInputs {
             socket_factory,
             local_workload_information,
             resolver,
+            disable_inbound_freebind,
+            crl_manager,
         })
     }
 }
@@ -301,7 +306,7 @@ impl Proxy {
             old_cfg.inbound_addr = inbound.address();
             let mut new_pi = (*pi).clone();
             new_pi.cfg = Arc::new(old_cfg);
-            std::mem::swap(&mut pi, &mut Arc::new(new_pi));
+            pi = Arc::new(new_pi);
             warn!("TEST FAKE: new address is {:?}", pi.cfg.inbound_addr);
         }
 
@@ -368,7 +373,7 @@ impl fmt::Display for AuthorizationRejectionError {
         match self {
             Self::NoWorkload => write!(fmt, "workload not found"),
             Self::WorkloadMismatch => write!(fmt, "workload mismatch"),
-            Self::ExplicitlyDenied(a, b) => write!(fmt, "explicitly denied by: {}/{}", a, b),
+            Self::ExplicitlyDenied(a, b) => write!(fmt, "explicitly denied by: {a}/{b}"),
             Self::NotAllowed => write!(fmt, "allow policies exist, but none allowed"),
         }
     }
@@ -406,6 +411,9 @@ pub enum Error {
 
     #[error("connection closed due to policy change")]
     AuthorizationPolicyLateRejection,
+
+    #[error("connection closed: peer certificate revoked by CRL")]
+    CertificateRevoked,
 
     #[error("connection closed due to policy rejection: {0}")]
     AuthorizationPolicyRejection(AuthorizationRejectionError),
@@ -446,6 +454,9 @@ pub enum Error {
     #[error("unknown waypoint: {0}")]
     UnknownWaypoint(String),
 
+    #[error("unknown network gateway: {0}")]
+    UnknownNetworkGateway(String),
+
     #[error("no service or workload for hostname: {0}")]
     NoHostname(String),
 
@@ -476,6 +487,9 @@ pub enum Error {
     #[error("requested service {0} found, but has no IP addresses")]
     NoIPForService(String),
 
+    #[error("no service for target address: {0}")]
+    NoService(SocketAddr),
+
     #[error(
         "ip addresses were resolved for workload {0}, but valid dns response had no A/AAAA records"
     )]
@@ -501,7 +515,7 @@ pub enum Error {
     #[error("dns: {0}")]
     Dns(#[from] ProtoError),
     #[error("dns lookup: {0}")]
-    DnsLookup(#[from] hickory_server::authority::LookupError),
+    DnsLookup(#[from] hickory_server::zone_handler::LookupError),
     #[error("dns response had no valid IP addresses")]
     DnsEmpty,
 }
@@ -547,6 +561,7 @@ pub struct TraceParent {
 
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
+pub const X_FORWARDED_NETWORK_HEADER: &str = "x-forwarded-network";
 
 impl TraceParent {
     pub fn header(&self) -> hyper::header::HeaderValue {
@@ -749,7 +764,10 @@ where
         return false;
     };
 
-    match state.fetch_destination(&gateway_address.destination).await {
+    match state
+        .fetch_destination(&gateway_address.destination, None)
+        .await
+    {
         Some(Address::Workload(wl)) => return predicate(wl.as_ref()),
         Some(Address::Service(svc)) => {
             for ep in svc.endpoints.iter() {
@@ -836,8 +854,8 @@ impl HboneAddress {
 impl std::fmt::Display for HboneAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HboneAddress::SocketAddr(addr) => write!(f, "{}", addr),
-            HboneAddress::SvcHostname(host, port) => write!(f, "{}:{}", host, port),
+            HboneAddress::SocketAddr(addr) => write!(f, "{addr}"),
+            HboneAddress::SvcHostname(host, port) => write!(f, "{host}:{port}"),
         }
     }
 }

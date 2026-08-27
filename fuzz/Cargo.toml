@@ -10,11 +10,15 @@ cargo-fuzz = true
 [dependencies]
 hyper = "1.1"
 libfuzzer-sys = "0.4"
-prost = "0.13"
+prost = { version = "0.14", default-features = false }
 anyhow = "1.0"
 
 [dependencies.ztunnel]
 path = ".."
+# No default features: jemalloc's unprefixed malloc/free conflicts with the
+# sanitizers cargo-fuzz/OSS-Fuzz build with (ASan heap interceptors).
+default-features = false
+features = ["tls-aws-lc"]
 
 # Prevent this from interfering with workspaces
 [workspace]

@@ -21,6 +21,17 @@ fn main() -> Result<(), anyhow::Error> {
     // Fuzzing uses custom cfg (https://rust-fuzz.github.io/book/cargo-fuzz/guide.html)
     // Tell cargo to expect this (https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html).
     println!("cargo::rustc-check-cfg=cfg(fuzzing)");
+
+    // OpenSSL version detection (https://docs.rs/openssl/latest/openssl/#feature-detection)
+    println!("cargo:rustc-check-cfg=cfg(ossl350)");
+    if let Ok(v) = env::var("DEP_OPENSSL_VERSION_NUMBER") {
+        let version = u64::from_str_radix(&v, 16).unwrap();
+        #[allow(clippy::unusual_byte_groupings)]
+        if version >= 0x3_05_00_00_0 {
+            println!("cargo:rustc-cfg=ossl350");
+        }
+    }
+
     let proto_files = [
         "proto/xds.proto",
         "proto/workload.proto",
@@ -36,7 +47,7 @@ fn main() -> Result<(), anyhow::Error> {
         .map(|i| std::env::current_dir().unwrap().join(i))
         .collect::<Vec<_>>();
     let config = {
-        let mut c = prost_build::Config::new();
+        let mut c = tonic_prost_build::Config::new();
         c.disable_comments(Some("."));
         c.bytes([
             ".istio.workload.Workload",
@@ -47,9 +58,10 @@ fn main() -> Result<(), anyhow::Error> {
         ]);
         c
     };
-    tonic_build::configure()
+    tonic_prost_build::configure()
+        .protoc_arg("--experimental_allow_proto3_optional")
         .build_server(true)
-        .compile_protos_with_config(
+        .compile_with_config(
             config,
             &proto_files
                 .iter()
@@ -79,7 +91,7 @@ fn main() -> Result<(), anyhow::Error> {
             for line in String::from_utf8(output.stdout).unwrap().lines() {
                 // Each line looks like `istio.io/pkg/version.buildGitRevision=abc`
                 if let Some((key, value)) = line.split_once('=') {
-                    let key = key.split('.').last().unwrap();
+                    let key = key.split('.').next_back().unwrap();
                     println!("cargo:rustc-env=ZTUNNEL_BUILD_{key}={value}");
                 } else {
                     println!("cargo:warning=invalid build output {line}");
@@ -94,9 +106,6 @@ fn main() -> Result<(), anyhow::Error> {
         "cargo:rustc-env=ZTUNNEL_BUILD_RUSTC_VERSION={}",
         rustc_version::version().unwrap()
     );
-    println!(
-        "cargo:rustc-env=ZTUNNEL_BUILD_PROFILE_NAME={}",
-        profile_name
-    );
+    println!("cargo:rustc-env=ZTUNNEL_BUILD_PROFILE_NAME={profile_name}");
     Ok(())
 }

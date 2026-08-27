@@ -25,20 +25,27 @@ use tokio::sync::watch;
 use tracing::{Instrument, debug, error, info, info_span, trace_span};
 
 use crate::identity::Identity;
+use crate::strng::Strng;
 
+use crate::proxy::connection_manager::await_revocation;
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent, util,
+    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
+    X_FORWARDED_NETWORK_HEADER, util,
 };
-use crate::proxy::{ConnectionOpen, ConnectionResult, DerivedWorkload, metrics};
+use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
 
+use crate::baggage::{self, Baggage};
 use crate::drain::DrainWatcher;
 use crate::drain::run_with_drain;
 use crate::proxy::h2::{H2Stream, client::WorkloadKey};
-use crate::state::ServiceResolutionMode;
-use crate::state::service::ServiceDescription;
-use crate::state::workload::{NetworkAddress, Protocol, Workload, address::Address};
-use crate::{assertions, copy, proxy, socket};
+use crate::state::service::{LoadBalancerMode, Service, ServiceDescription};
+use crate::state::workload::OutboundProtocol;
+use crate::state::workload::{InboundProtocol, NetworkAddress, Workload, address::Address};
+use crate::state::{ServiceResolutionMode, Upstream};
+use crate::{assertions, copy, proxy, socket, tls};
+
+use super::h2::TokioH2Stream;
 
 pub struct Outbound {
     pi: Arc<ProxyInputs>,
@@ -48,11 +55,12 @@ pub struct Outbound {
 
 impl Outbound {
     pub(super) async fn new(pi: Arc<ProxyInputs>, drain: DrainWatcher) -> Result<Outbound, Error> {
-        let listener = pi
+        let mut listener = pi
             .socket_factory
             .tcp_bind(pi.cfg.outbound_addr)
             .map_err(|e| Error::Bind(pi.cfg.outbound_addr, e))?;
         let transparent = super::maybe_set_transparent(&pi, &listener)?;
+        listener.set_socket_options(Some(pi.cfg.socket_config));
 
         info!(
             address=%listener.local_addr(),
@@ -76,6 +84,8 @@ impl Outbound {
             self.pi.cfg.clone(),
             self.pi.socket_factory.clone(),
             self.pi.local_workload_information.clone(),
+            self.pi.crl_manager.clone(),
+            self.pi.metrics.clone(),
         );
         let pi = self.pi.clone();
         let accept = async move |drain: DrainWatcher, force_shutdown: watch::Receiver<()>| {
@@ -87,6 +97,11 @@ impl Outbound {
                 let mut force_shutdown = force_shutdown.clone();
                 match socket {
                     Ok((stream, _remote)) => {
+                        let socket_labels = metrics::SocketLabels {
+                            reporter: Reporter::source,
+                        };
+                        self.pi.metrics.record_socket_open(&socket_labels);
+
                         let mut oc = OutboundConnection {
                             pi: self.pi.clone(),
                             id: TraceParent::new(),
@@ -94,7 +109,12 @@ impl Outbound {
                             hbone_port: self.pi.cfg.inbound_addr.port(),
                         };
                         let span = info_span!("outbound", id=%oc.id);
+                        let metrics_for_socket_close = self.pi.metrics.clone();
                         let serve_outbound_connection = async move {
+                            let _socket_guard = metrics::SocketCloseGuard::new(
+                                metrics_for_socket_close,
+                                Reporter::source,
+                            );
                             debug!(component="outbound", "connection started");
                             // Since this task is spawned, make sure we are guaranteed to terminate
                             tokio::select! {
@@ -108,7 +128,7 @@ impl Outbound {
                             debug!(component="outbound", dur=?start.elapsed(), "connection completed");
                         }.instrument(span);
 
-                        assertions::size_between_ref(1000, 1750, &serve_outbound_connection);
+                        assertions::size_between_ref(1000, 2000, &serve_outbound_connection);
                         tokio::spawn(serve_outbound_connection);
                     }
                     Err(e) => {
@@ -140,8 +160,18 @@ pub(super) struct OutboundConnection {
 
 impl OutboundConnection {
     async fn proxy(&mut self, source_stream: TcpStream) {
-        let source_addr =
-            socket::to_canonical(source_stream.peer_addr().expect("must receive peer addr"));
+        let peer = match source_stream.peer_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                debug!(
+                    component = "outbound",
+                    "failed to get peer address, dropping connection: {}", e
+                );
+                return;
+            }
+        };
+
+        let source_addr = socket::to_canonical(peer);
         let dst_addr = socket::orig_dst_addr_or_default(&source_stream);
         self.proxy_to(source_stream, source_addr, dst_addr).await;
     }
@@ -183,8 +213,8 @@ impl OutboundConnection {
         );
 
         let metrics = self.pi.metrics.clone();
-        let hbone_target = req.hbone_target_destination.map(HboneAddress::SocketAddr);
-        let result_tracker = Box::new(ConnectionResult::new(
+        let hbone_target = req.hbone_target_destination.clone();
+        let connection_result_builder = Box::new(ConnectionResultBuilder::new(
             source_addr,
             req.actual_destination,
             hbone_target,
@@ -193,17 +223,152 @@ impl OutboundConnection {
             metrics,
         ));
 
-        let res = match req.protocol {
-            Protocol::HBONE => {
-                self.proxy_to_hbone(source_stream, source_addr, &req, &result_tracker)
+        match req.protocol {
+            OutboundProtocol::DOUBLEHBONE => {
+                // We box this since its not a common path and it would make the future really big.
+                Box::pin(self.proxy_to_double_hbone(
+                    source_stream,
+                    source_addr,
+                    &req,
+                    connection_result_builder,
+                ))
+                .await
+            }
+            OutboundProtocol::HBONE => {
+                self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
                     .await
             }
-            Protocol::TCP => {
-                self.proxy_to_tcp(source_stream, &req, &result_tracker)
+            OutboundProtocol::TCP => {
+                self.proxy_to_tcp(source_stream, &req, connection_result_builder)
                     .await
             }
         };
-        result_tracker.record(res)
+    }
+
+    async fn proxy_to_double_hbone(
+        &mut self,
+        stream: TcpStream,
+        remote_addr: SocketAddr,
+        req: &Request,
+        mut connection_stats_builder: Box<ConnectionResultBuilder>,
+    ) {
+        // async move block allows use of ? operator
+        let res = (async move {
+            // Create the outer HBONE stream. The outer tunnel's revocation signal
+            // is captured here so it can still be attributed downstream.
+            let (upgraded, _, outer_revoked) =
+                Box::pin(self.send_hbone_request(remote_addr, req)).await?;
+            // Wrap upgraded to implement tokio's Async{Write,Read}
+            let upgraded = TokioH2Stream::new(upgraded);
+
+            // For the inner one, we do it manually to avoid connection pooling.
+            // Otherwise, we would only ever reach one workload in the remote cluster.
+            // We also need to abort tasks the right way to get graceful terminations.
+            let wl_key = WorkloadKey {
+                src_id: req.source.identity(),
+                dst_id: req.final_sans.clone(),
+                src: remote_addr.ip(),
+                dst: req.actual_destination,
+            };
+
+            // Fetch certs and establish inner TLS connection.
+            let cert = self
+                .pi
+                .local_workload_information
+                .fetch_certificate()
+                .await?;
+            let connector =
+                cert.outbound_connector(wl_key.dst_id.clone(), self.pi.crl_manager.clone())?;
+            let tls_stream = connector.connect(upgraded).await.inspect_err(|e| {
+                if crate::tls::io_error_is_cert_revoked(e) {
+                    self.pi
+                        .metrics
+                        .record_crl_rejection(crate::proxy::metrics::Reporter::source);
+                }
+            })?;
+            let (_, ssl) = tls_stream.get_ref();
+            let peer_identity = {
+                let x509_cert = tls::certificate_from_connection(ssl);
+                tls::identity(&x509_cert)
+            };
+
+            // Spawn inner CONNECT tunnel
+            let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+            // Enforce CRL revocation on this inner tunnel for its lifetime
+            let revocation = self.pi.crl_manager.as_ref().map(|crl_manager| {
+                crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
+                    ssl,
+                    peer_identity.clone(),
+                    cert.root_store(),
+                    webpki::KeyUsage::server_auth(),
+                    crate::proxy::metrics::Reporter::source,
+                ))
+            });
+            let mut sender = super::h2::client::spawn_connection(
+                self.pi.cfg.clone(),
+                tls_stream,
+                drain_rx,
+                wl_key,
+                revocation,
+            )
+            .await?;
+            // The inner tunnel's revocation signal
+            let inner_revoked = sender.revoked_receiver();
+            let origin_network = &self.pi.cfg.network;
+            let http_request = self.create_hbone_request(remote_addr, req, Some(origin_network));
+            let (inner_upgraded, baggage) = sender.send_request(http_request).await?;
+
+            // Proxy
+            let derived_workload = baggage.map(|baggage| DerivedWorkload {
+                workload_name: baggage.workload_name,
+                app: baggage.service_name,
+                namespace: baggage.namespace,
+                identity: peer_identity,
+                cluster_id: baggage.cluster_id,
+                region: baggage.region,
+                zone: baggage.zone,
+                revision: baggage.revision,
+            });
+            Result::<_, Error>::Ok((
+                derived_workload,
+                drain_tx,
+                inner_upgraded,
+                outer_revoked,
+                inner_revoked,
+            ))
+        })
+        .await;
+
+        match res {
+            Err(e) => {
+                let connection_stats = connection_stats_builder.build();
+                connection_stats.record(Err(e));
+            }
+            Ok((derived_workload, drain_tx, inner_upgraded, outer_revoked, inner_revoked)) => {
+                if let Some(derived_workload) = derived_workload {
+                    *connection_stats_builder =
+                        connection_stats_builder.with_derived_destination(&derived_workload);
+                }
+
+                let connection_stats = connection_stats_builder.build();
+                // Race the copy against BOTH tunnels' revocation signals (inner = final dest, outer = e/w gw).
+                // `biased` with the revocation arms first makes attribution deterministic,
+                // so a teardown from either hop surfaces as CERT_REVOKED rather than generic reset.
+                let res = tokio::select! {
+                    biased;
+                    _ = await_revocation(outer_revoked) => Err(Error::CertificateRevoked),
+                    _ = await_revocation(inner_revoked) => Err(Error::CertificateRevoked),
+                    res = copy::copy_bidirectional(
+                        copy::TcpStreamSplitter(stream),
+                        inner_upgraded,
+                        &connection_stats,
+                    ) => res,
+                };
+                let _ = drain_tx.send(true);
+
+                connection_stats.record(res);
+            }
+        }
     }
 
     async fn proxy_to_hbone(
@@ -211,91 +376,211 @@ impl OutboundConnection {
         stream: TcpStream,
         remote_addr: SocketAddr,
         req: &Request,
-        connection_stats: &ConnectionResult,
-    ) -> Result<(), Error> {
-        let upgraded = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
-        copy::copy_bidirectional(copy::TcpStreamSplitter(stream), upgraded, connection_stats).await
+        connection_stats_builder: Box<ConnectionResultBuilder>,
+    ) {
+        let connection_stats = Box::new(connection_stats_builder.build());
+        let res = (async {
+            let (upgraded, _, revoked) =
+                Box::pin(self.send_hbone_request(remote_addr, req)).await?;
+            // Race the data copy against the tunnel's revocation signal. `biased` with the
+            // revocation arm first makes attribution deterministic: the driver sets the signal
+            // before tearing the tunnel down, so whenever a teardown is due to revocation this arm
+            // wins and `record` logs `CERT_REVOKED` rather than the generic reset the copy observed.
+            tokio::select! {
+                biased;
+                _ = await_revocation(revoked) => Err(Error::CertificateRevoked),
+                res = copy::copy_bidirectional(
+                    copy::TcpStreamSplitter(stream),
+                    upgraded,
+                    &connection_stats,
+                ) => res,
+            }
+        })
+        .await;
+        connection_stats.record(res);
     }
 
-    async fn send_hbone_request(
-        &mut self,
+    fn create_hbone_request(
+        &self,
         remote_addr: SocketAddr,
         req: &Request,
-    ) -> Result<H2Stream, Error> {
-        let request = http::Request::builder()
+        origin_network: Option<&Strng>,
+    ) -> http::Request<()> {
+        let mut builder = http::Request::builder()
             .uri(
                 req.hbone_target_destination
+                    .as_ref()
                     .expect("HBONE must have target")
                     .to_string(),
             )
             .method(hyper::Method::CONNECT)
             .version(hyper::Version::HTTP_2)
-            .header(BAGGAGE_HEADER, baggage(req, self.pi.cfg.cluster_id.clone()))
+            .header(BAGGAGE_HEADER, baggage(req))
             .header(
                 FORWARDED,
                 build_forwarded(remote_addr, &req.intended_destination_service),
             )
-            .header(TRACEPARENT_HEADER, self.id.header())
-            .body(())
-            .expect("builder with known status code should not fail");
+            .header(TRACEPARENT_HEADER, self.id.header());
 
+        // Add x-istio-origin-network header for inner CONNECT requests in double HBONE
+        if let Some(network) = origin_network {
+            builder = builder.header(X_FORWARDED_NETWORK_HEADER, network.as_str());
+        }
+
+        builder
+            .body(())
+            .expect("builder with known status code should not fail")
+    }
+
+    /// returns upgraded stream, peer's baggage, and the tunnel's CRL revocation signal
+    async fn send_hbone_request(
+        &mut self,
+        remote_addr: SocketAddr,
+        req: &Request,
+    ) -> Result<(H2Stream, Option<Baggage>, Option<watch::Receiver<bool>>), Error> {
+        // This is the single cluster/single-HBONE codepath (and also the outer tunnel
+        // for double HBONE). We don't need the x-istio-origin-network header here because:
+        // - For single HBONE: both source and destination are in the same network
+        // - For double HBONE outer: the gateway doesn't need origin network info
+        let request = self.create_hbone_request(remote_addr, req, None);
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             // Clone here shouldn't be needed ideally, we could just take ownership of Request.
-            // But that
             dst_id: req.upstream_sans.clone(),
             src: remote_addr.ip(),
             dst: req.actual_destination,
         });
-        let upgraded = Box::pin(self.pool.send_request_pooled(&pool_key, request))
-            .instrument(trace_span!("outbound connect"))
-            .await?;
-        Ok(upgraded)
+        let (upgraded, baggage, revoked) =
+            Box::pin(self.pool.send_request_pooled(&pool_key, request))
+                .instrument(trace_span!("outbound connect"))
+                .await?;
+        Ok((upgraded, baggage, revoked))
     }
 
     async fn proxy_to_tcp(
         &mut self,
         stream: TcpStream,
         req: &Request,
-        connection_stats: &ConnectionResult,
-    ) -> Result<(), Error> {
-        let outbound = super::freebind_connect(
-            None, // No need to spoof source IP on outbound
-            req.actual_destination,
-            self.pi.socket_factory.as_ref(),
-        )
-        .await?;
+        connection_stats_builder: Box<ConnectionResultBuilder>,
+    ) {
+        let connection_stats = Box::new(connection_stats_builder.build());
 
-        // Proxying data between downstream and upstream
-        copy::copy_bidirectional(
-            copy::TcpStreamSplitter(stream),
-            copy::TcpStreamSplitter(outbound),
-            connection_stats,
-        )
-        .await
+        let res = (async {
+            let outbound = super::freebind_connect(
+                None, // No need to spoof source IP on outbound
+                req.actual_destination,
+                self.pi.socket_factory.as_ref(),
+            )
+            .await?;
+
+            // Proxying data between downstream and upstream
+            copy::copy_bidirectional(
+                copy::TcpStreamSplitter(stream),
+                copy::TcpStreamSplitter(outbound),
+                &connection_stats,
+            )
+            .await
+        })
+        .await;
+        connection_stats.record(res);
     }
 
     fn conn_metrics_from_request(req: &Request) -> ConnectionOpen {
-        let derived_source = if req.protocol == Protocol::HBONE {
-            Some(DerivedWorkload {
-                // We are going to do mTLS, so report our identity
-                identity: Some(req.source.as_ref().identity()),
-                ..Default::default()
-            })
-        } else {
-            None
+        let (derived_source, security_policy) = match req.protocol {
+            OutboundProtocol::HBONE | OutboundProtocol::DOUBLEHBONE => (
+                Some(DerivedWorkload {
+                    // We are going to do mTLS, so report our identity
+                    identity: Some(req.source.as_ref().identity()),
+                    ..Default::default()
+                }),
+                metrics::SecurityPolicy::mutual_tls,
+            ),
+            OutboundProtocol::TCP => (None, metrics::SecurityPolicy::unknown),
         };
         ConnectionOpen {
             reporter: Reporter::source,
             derived_source,
             source: Some(req.source.clone()),
             destination: req.actual_destination_workload.clone(),
-            connection_security_policy: if req.protocol == Protocol::HBONE {
-                metrics::SecurityPolicy::mutual_tls
-            } else {
-                metrics::SecurityPolicy::unknown
-            },
+            connection_security_policy: security_policy,
             destination_service: req.intended_destination_service.clone(),
+        }
+    }
+
+    // This function is called when the select next hop is on a different network,
+    // so we expect the upstream workload to have a network gatewy configured.
+    //
+    // When we use a gateway to reach to a workload on a remote network we have to
+    // use double HBONE (HBONE incapsulated inside HBONE). The gateway will
+    // terminate the outer HBONE tunnel and forward the inner HBONE to the actual
+    // destination as a opaque stream of bytes and the actual destination will
+    // interpret it as an HBONE connection.
+    //
+    // If the upstream workload does not have an E/W gateway this function returns
+    // an error indicating that it could not find a valid destination.
+    //
+    // A note about double HBONE, in double HBONE both inner and outer HBONE use
+    // destination service name as HBONE target URI.
+    //
+    // Having target URI in the outer HBONE tunnel allows E/W gateway to figure out
+    // where to route the data next witout the need to terminate inner HBONE tunnel.
+    // In other words, it could forward inner HBONE as if it's an opaque stream of
+    // bytes without trying to interpret it.
+    //
+    // NOTE: when connecting through an E/W gateway, regardless of whether there is
+    // a waypoint or not, we always use service hostname and the service port. It's
+    // somewhat different from how regular HBONE works, so I'm calling it out here.
+    async fn build_request_through_gateway(
+        &self,
+        source: Arc<Workload>,
+        // next hop on the remote network that we picked as our destination.
+        // It may be a local view of a Waypoint workload on remote network or
+        // a local view of the service workload (when waypoint is not
+        // configured).
+        upstream: Upstream,
+        // This is a target service we wanted to reach in the first place.
+        //
+        // NOTE: Crossing network boundaries is only supported for services
+        // at the moment, so we should always have a service we could use.
+        service: &Service,
+        target: SocketAddr,
+    ) -> Result<Request, Error> {
+        if let Some(gateway) = &upstream.workload.network_gateway {
+            let gateway_upstream = self
+                .pi
+                .state
+                .fetch_network_gateway(gateway, &source, target)
+                .await?;
+            let hbone_target_destination = Some(HboneAddress::SvcHostname(
+                service.hostname.clone(),
+                target.port(),
+            ));
+
+            debug!("built request to a destination on another network through an E/W gateway");
+            Ok(Request {
+                protocol: OutboundProtocol::DOUBLEHBONE,
+                source,
+                hbone_target_destination,
+                actual_destination_workload: Some(gateway_upstream.workload.clone()),
+                intended_destination_service: Some(ServiceDescription::from(service)),
+                actual_destination: gateway_upstream.workload_socket_addr().ok_or(
+                    Error::NoValidDestination(Box::new((*gateway_upstream.workload).clone())),
+                )?,
+                // The outer tunnel of double HBONE is terminated by the E/W
+                // gateway and so for the credentials of the next hop
+                // (upstream_sans) we use gateway credentials.
+                upstream_sans: gateway_upstream.workload_and_services_san(),
+                // The inner HBONE tunnel is terminated by either the server
+                // we want to reach or a Waypoint in front of it, depending on
+                // the configuration. So for the final destination credentials
+                // (final_sans) we use the upstream workload credentials.
+                final_sans: upstream.service_sans(),
+            })
+        } else {
+            // Do not try to send cross-network traffic without network gateway.
+            Err(Error::NoValidDestination(Box::new(
+                (*upstream.workload).clone(),
+            )))
         }
     }
 
@@ -311,11 +596,14 @@ impl OutboundConnection {
 
         // If this is to-service traffic check for a service waypoint
         // Capture result of whether this is svc addressed
-        let svc_addressed = if let Some(Address::Service(target_service)) = state
-            .fetch_address(&NetworkAddress {
-                network: self.pi.cfg.network.clone(),
-                address: target.ip(),
-            })
+        let service = if let Some(Address::Service(target_service)) = state
+            .fetch_address(
+                &NetworkAddress {
+                    network: self.pi.cfg.network.clone(),
+                    address: target.ip(),
+                },
+                Some(&source_workload.namespace),
+            )
             .await
         {
             // if we have a waypoint for this svc, use it; otherwise route traffic normally
@@ -323,24 +611,42 @@ impl OutboundConnection {
                 .fetch_service_waypoint(&target_service, &source_workload, target)
                 .await?
             {
+                if waypoint.workload.network != source_workload.network {
+                    debug!("picked a waypoint on remote network");
+                    return self
+                        .build_request_through_gateway(
+                            source_workload.clone(),
+                            waypoint,
+                            &target_service,
+                            target,
+                        )
+                        .await;
+                }
+
                 let upstream_sans = waypoint.workload_and_services_san();
-                let actual_destination = waypoint.workload_socket_addr();
+                let actual_destination =
+                    waypoint
+                        .workload_socket_addr()
+                        .ok_or(Error::NoValidDestination(Box::new(
+                            (*waypoint.workload).clone(),
+                        )))?;
                 debug!("built request to service waypoint proxy");
                 return Ok(Request {
-                    protocol: Protocol::HBONE,
+                    protocol: OutboundProtocol::HBONE,
                     source: source_workload,
-                    hbone_target_destination: Some(target),
+                    hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
                     actual_destination_workload: Some(waypoint.workload),
                     intended_destination_service: Some(ServiceDescription::from(&*target_service)),
                     actual_destination,
                     upstream_sans,
+                    final_sans: vec![],
                 });
             }
             // this was service addressed but we did not find a waypoint
-            true
+            Some(target_service)
         } else {
             // this wasn't service addressed
-            false
+            None
         };
 
         let Some(us) = state
@@ -352,21 +658,55 @@ impl OutboundConnection {
             )
             .await?
         else {
-            if svc_addressed {
+            if let Some(service) = service
+                && service.
+                load_balancer.
+                as_ref().
+                // If we are not a passthrough service, we should have an upstream
+                map(|lb| lb.mode != LoadBalancerMode::Passthrough).
+                // If the service had no lb, we should have an upstream
+                unwrap_or(true)
+            {
                 return Err(Error::NoHealthyUpstream(target));
             }
             debug!("built request as passthrough; no upstream found");
             return Ok(Request {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 source: source_workload,
                 hbone_target_destination: None,
                 actual_destination_workload: None,
                 intended_destination_service: None,
                 actual_destination: target,
                 upstream_sans: vec![],
+                final_sans: vec![],
             });
         };
 
+        // Check whether we are using an E/W gateway and sending cross network traffic
+        if us.workload.network != source_workload.network {
+            // Workloads on remote network must be service addressed, so if we got here
+            // and we don't have a service for the original target address then it's a
+            // bug either in ztunnel itself or in istiod.
+            //
+            // For a double HBONE protocol implementation we have to know the
+            // destination service and if there is no service for the target it's a bug.
+            //
+            // This situation "should never happen" because for workloads fetch_upstream
+            // above only checks the workloads on the same network as this ztunnel
+            // instance and therefore it should not be able to find a workload on a
+            // different network.
+            debug_assert!(
+                service.is_some(),
+                "workload on remote network is not service addressed"
+            );
+            debug!("picked a workload on remote network");
+            let service = service.as_ref().ok_or(Error::NoService(target))?;
+            return self
+                .build_request_through_gateway(source_workload.clone(), us, service, target)
+                .await;
+        }
+
+        // We are not using a network gateway and there is no workload address.
         let from_waypoint = proxy::check_from_waypoint(
             state,
             &us.workload,
@@ -378,51 +718,67 @@ impl OutboundConnection {
         // Check if we need to go through a workload addressed waypoint.
         // Don't traverse waypoint twice if the source is sandwich-outbound.
         // Don't traverse waypoint if traffic was addressed to a service (handled before)
-        if !from_waypoint && !svc_addressed {
+        if !from_waypoint && service.is_none() {
             // For case upstream server has enabled waypoint
             let waypoint = state
                 .fetch_workload_waypoint(&us.workload, &source_workload, target)
                 .await?;
             if let Some(waypoint) = waypoint {
-                let actual_destination = waypoint.workload_socket_addr();
+                let actual_destination =
+                    waypoint
+                        .workload_socket_addr()
+                        .ok_or(Error::NoValidDestination(Box::new(
+                            (*waypoint.workload).clone(),
+                        )))?;
                 let upstream_sans = waypoint.workload_and_services_san();
                 debug!("built request to workload waypoint proxy");
                 return Ok(Request {
                     // Always use HBONE here
-                    protocol: Protocol::HBONE,
+                    protocol: OutboundProtocol::HBONE,
                     source: source_workload,
                     // Use the original VIP, not translated
-                    hbone_target_destination: Some(target),
+                    hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
                     actual_destination_workload: Some(waypoint.workload),
                     intended_destination_service: us.destination_service.clone(),
                     actual_destination,
                     upstream_sans,
+                    final_sans: vec![],
                 });
             }
             // Workload doesn't have a waypoint; send directly
         }
 
+        let selected_workload_ip = us
+            .selected_workload_ip
+            .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?;
+
         // only change the port if we're sending HBONE
         let actual_destination = match us.workload.protocol {
-            Protocol::HBONE => SocketAddr::from((us.selected_workload_ip, self.hbone_port)),
-            Protocol::TCP => us.workload_socket_addr(),
+            InboundProtocol::HBONE => SocketAddr::from((selected_workload_ip, self.hbone_port)),
+            InboundProtocol::TCP => us
+                .workload_socket_addr()
+                .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?,
         };
         let hbone_target_destination = match us.workload.protocol {
-            Protocol::HBONE => Some(us.workload_socket_addr()),
-            Protocol::TCP => None,
+            InboundProtocol::HBONE => Some(HboneAddress::SocketAddr(
+                us.workload_socket_addr()
+                    .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?,
+            )),
+            InboundProtocol::TCP => None,
         };
 
         // For case no waypoint for both side and direct to remote node proxy
-        let upstream_sans = us.workload_and_services_san();
+        let (upstream_sans, final_sans) = (us.workload_and_services_san(), vec![]);
         debug!("built request to workload");
         Ok(Request {
-            protocol: us.workload.protocol,
+            protocol: OutboundProtocol::from(us.workload.protocol),
             source: source_workload,
             hbone_target_destination,
             actual_destination_workload: Some(us.workload.clone()),
             intended_destination_service: us.destination_service.clone(),
             actual_destination,
             upstream_sans,
+            final_sans,
         })
     }
 }
@@ -438,22 +794,13 @@ fn build_forwarded(remote_addr: SocketAddr, server: &Option<ServiceDescription>)
     }
 }
 
-fn baggage(r: &Request, cluster: String) -> String {
-    format!(
-        "k8s.cluster.name={cluster},k8s.namespace.name={namespace},k8s.{workload_type}.name={workload_name},service.name={name},service.version={version},cloud.region={region},cloud.availability_zone={zone}",
-        namespace = r.source.namespace,
-        workload_type = r.source.workload_type,
-        workload_name = r.source.workload_name,
-        name = r.source.canonical_name,
-        version = r.source.canonical_revision,
-        region = r.source.locality.region,
-        zone = r.source.locality.zone,
-    )
+fn baggage(r: &Request) -> String {
+    baggage::baggage_header_val(&r.source.baggage(), &r.source.workload_type)
 }
 
 #[derive(Debug)]
 struct Request {
-    protocol: Protocol,
+    protocol: OutboundProtocol,
     // Source workload sending the request
     source: Arc<Workload>,
     // The actual destination workload we are targeting. When proxying through a waypoint, this is the waypoint,
@@ -469,11 +816,16 @@ struct Request {
     // When using HBONE, the `hbone_target_destination` is the inner :authority and `actual_destination` is the TCP destination.
     actual_destination: SocketAddr,
     // If using HBONE, the inner (:authority) of the HBONE request.
-    hbone_target_destination: Option<SocketAddr>,
+    hbone_target_destination: Option<HboneAddress>,
 
     // The identity we will assert for the next hop; this may not be the same as actual_destination_workload
     // in the case of proxies along the path.
     upstream_sans: Vec<Identity>,
+
+    // The identity of workload that will ultimately process this request.
+    // This field only matters if we need to know both the identity of the next hop, as well as the
+    // final hop (currently, this is only double HBONE).
+    final_sans: Vec<Identity>,
 }
 
 #[cfg(test)]
@@ -490,11 +842,13 @@ mod tests {
     use crate::state::WorkloadInfo;
     use crate::test_helpers::helpers::{initialize_telemetry, test_proxy_metrics};
     use crate::test_helpers::new_proxy_state;
-    use crate::xds::istio::workload::TunnelProtocol as XdsProtocol;
     use crate::xds::istio::workload::Workload as XdsWorkload;
     use crate::xds::istio::workload::address::Type as XdsAddressType;
     use crate::xds::istio::workload::{IpFamilies, Port};
-    use crate::xds::istio::workload::{NetworkAddress as XdsNetworkAddress, PortList};
+    use crate::xds::istio::workload::{LoadBalancing, TunnelProtocol as XdsProtocol};
+    use crate::xds::istio::workload::{
+        NamespacedHostname as XdsNamespacedHostname, NetworkAddress as XdsNetworkAddress, PortList,
+    };
     use crate::xds::istio::workload::{NetworkMode, Service as XdsService};
     use crate::{identity, xds};
 
@@ -580,12 +934,16 @@ mod tests {
                 local_workload_information: local_workload_information.clone(),
                 connection_manager: ConnectionManager::default(),
                 resolver: None,
+                disable_inbound_freebind: false,
+                crl_manager: None,
             }),
             id: TraceParent::new(),
             pool: WorkloadHBONEPool::new(
                 cfg.clone(),
                 sock_fact,
                 local_workload_information.clone(),
+                None,
+                test_proxy_metrics(),
             ),
             hbone_port: cfg.inbound_addr.port(),
         };
@@ -607,6 +965,7 @@ mod tests {
                     protocol: r.protocol,
                     hbone_destination: &r
                         .hbone_target_destination
+                        .as_ref()
                         .map(|s| s.to_string())
                         .unwrap_or_default(),
                     destination: &r.actual_destination.to_string(),
@@ -629,9 +988,421 @@ mod tests {
                 ..Default::default()
             }),
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "1.2.3.4:80",
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn build_request_wrong_network() {
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                XdsAddressType::Service(XdsService {
+                    hostname: "example.com".to_string(),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![127, 0, 0, 3],
+                        length: None,
+                    }],
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "cluster1//v1/Pod/default/remote-pod".to_string(),
+                    addresses: vec![Bytes::copy_from_slice(&[10, 0, 0, 2])],
+                    network: "remote".to_string(),
+                    services: std::collections::HashMap::from([(
+                        "/example.com".to_string(),
+                        PortList {
+                            ports: vec![Port {
+                                service_port: 80,
+                                target_port: 8080,
+                                app_protocol: 0,
+                            }],
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+            ],
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn build_request_double_hbone() {
+        // example.com service has a workload on remote network.
+        // E/W gateway is addressed by an IP.
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                XdsAddressType::Service(XdsService {
+                    hostname: "example.com".to_string(),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![127, 0, 0, 3],
+                        length: None,
+                    }],
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "cluster1//v1/Pod/default/remote-pod".to_string(),
+                    addresses: vec![],
+                    network: "remote".to_string(),
+                    network_gateway: Some(xds::istio::workload::GatewayAddress {
+                        destination: Some(
+                            xds::istio::workload::gateway_address::Destination::Address(
+                                XdsNetworkAddress {
+                                    network: "remote".to_string(),
+                                    address: vec![10, 22, 1, 1],
+                                    length: None,
+                                },
+                            ),
+                        ),
+                        hbone_mtls_port: 15009,
+                    }),
+                    services: std::collections::HashMap::from([(
+                        "/example.com".to_string(),
+                        PortList {
+                            ports: vec![Port {
+                                service_port: 80,
+                                target_port: 8080,
+                                app_protocol: 0,
+                            }],
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "cluster1//v1/Pod/default/ew-gtw".to_string(),
+                    addresses: vec![Bytes::copy_from_slice(&[10, 22, 1, 1])],
+                    network: "remote".to_string(),
+                    ..Default::default()
+                }),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::DOUBLEHBONE,
+                hbone_destination: "example.com:80",
+                destination: "10.22.1.1:15009",
+            }),
+        )
+        .await;
+        // example.com service has a workload on remote network.
+        // E/W gateway is addressed by a hostname.
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                XdsAddressType::Service(XdsService {
+                    hostname: "example.com".to_string(),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![127, 0, 0, 3],
+                        length: None,
+                    }],
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                    ..Default::default()
+                }),
+                XdsAddressType::Service(XdsService {
+                    hostname: "ew-gtw".to_string(),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![127, 0, 0, 4],
+                        length: None,
+                    }],
+                    ports: vec![Port {
+                        service_port: 15009,
+                        target_port: 15009,
+                        app_protocol: 0,
+                    }],
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "cluster1//v1/Pod/default/remote-pod".to_string(),
+                    addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 6])],
+                    network: "remote".to_string(),
+                    network_gateway: Some(xds::istio::workload::GatewayAddress {
+                        hbone_mtls_port: 15009,
+                        destination: Some(
+                            xds::istio::workload::gateway_address::Destination::Hostname(
+                                XdsNamespacedHostname {
+                                    namespace: Default::default(),
+                                    hostname: "ew-gtw".into(),
+                                },
+                            ),
+                        ),
+                    }),
+                    services: std::collections::HashMap::from([(
+                        "/example.com".to_string(),
+                        PortList {
+                            ports: vec![Port {
+                                service_port: 80,
+                                target_port: 8080,
+                                app_protocol: 0,
+                            }],
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "cluster1//v1/Pod/default/ew-gtw".to_string(),
+                    addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 5])],
+                    network: "remote".to_string(),
+                    services: std::collections::HashMap::from([(
+                        "/ew-gtw".to_string(),
+                        PortList {
+                            ports: vec![Port {
+                                service_port: 15009,
+                                target_port: 15008,
+                                app_protocol: 0,
+                            }],
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::DOUBLEHBONE,
+                hbone_destination: "example.com:80",
+                destination: "127.0.0.5:15008",
+            }),
+        )
+        .await;
+        // example.com service has a waypoint and waypoint workload is on remote network.
+        // E/W gateway is addressed by an IP.
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                XdsAddressType::Service(XdsService {
+                    hostname: "example.com".to_string(),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![127, 0, 0, 3],
+                        length: None,
+                    }],
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                    waypoint: Some(xds::istio::workload::GatewayAddress {
+                        destination: Some(
+                            xds::istio::workload::gateway_address::Destination::Hostname(
+                                XdsNamespacedHostname {
+                                    namespace: Default::default(),
+                                    hostname: "waypoint.com".into(),
+                                },
+                            ),
+                        ),
+                        hbone_mtls_port: 15008,
+                    }),
+                    ..Default::default()
+                }),
+                XdsAddressType::Service(XdsService {
+                    hostname: "waypoint.com".to_string(),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![127, 0, 0, 4],
+                        length: None,
+                    }],
+                    ports: vec![Port {
+                        service_port: 15008,
+                        target_port: 15008,
+                        app_protocol: 0,
+                    }],
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "Kubernetes//Pod/default/remote-waypoint-pod".to_string(),
+                    addresses: vec![],
+                    network: "remote".to_string(),
+                    network_gateway: Some(xds::istio::workload::GatewayAddress {
+                        destination: Some(
+                            xds::istio::workload::gateway_address::Destination::Address(
+                                XdsNetworkAddress {
+                                    network: "remote".to_string(),
+                                    address: vec![10, 22, 1, 1],
+                                    length: None,
+                                },
+                            ),
+                        ),
+                        hbone_mtls_port: 15009,
+                    }),
+                    services: std::collections::HashMap::from([(
+                        "/waypoint.com".to_string(),
+                        PortList {
+                            ports: vec![Port {
+                                service_port: 15008,
+                                target_port: 15008,
+                                app_protocol: 0,
+                            }],
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                XdsAddressType::Workload(XdsWorkload {
+                    uid: "Kubernetes//Pod/default/remote-ew-gtw".to_string(),
+                    addresses: vec![Bytes::copy_from_slice(&[10, 22, 1, 1])],
+                    network: "remote".to_string(),
+                    ..Default::default()
+                }),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::DOUBLEHBONE,
+                hbone_destination: "example.com:80",
+                destination: "10.22.1.1:15009",
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn build_request_failover_to_remote() {
+        // Similar to the double HBONE test that we already have, but it sets up a scenario when
+        // load balancing logic will pick a workload on a remote cluster when local workloads are
+        // unhealthy, thus showing the expected failover behavior.
+        let service = XdsAddressType::Service(XdsService {
+            hostname: "example.com".to_string(),
+            addresses: vec![XdsNetworkAddress {
+                network: "".to_string(),
+                address: vec![127, 0, 0, 3],
+                length: None,
+            }],
+            ports: vec![Port {
+                service_port: 80,
+                target_port: 8080,
+                app_protocol: 0,
+            }],
+            // Prefer routing to workloads on the same network, but when nothing is healthy locally
+            // allow failing over to remote networks.
+            load_balancing: Some(xds::istio::workload::LoadBalancing {
+                routing_preference: vec![
+                    xds::istio::workload::load_balancing::Scope::Network.into(),
+                ],
+                mode: xds::istio::workload::load_balancing::Mode::Failover.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let ew_gateway = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/remote-ew-gtw".to_string(),
+            addresses: vec![Bytes::copy_from_slice(&[10, 22, 1, 1])],
+            network: "remote".to_string(),
+            ..Default::default()
+        });
+        let remote_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/remote-example.com-pod".to_string(),
+            addresses: vec![],
+            network: "remote".to_string(),
+            network_gateway: Some(xds::istio::workload::GatewayAddress {
+                destination: Some(xds::istio::workload::gateway_address::Destination::Address(
+                    XdsNetworkAddress {
+                        network: "remote".to_string(),
+                        address: vec![10, 22, 1, 1],
+                        length: None,
+                    },
+                )),
+                hbone_mtls_port: 15009,
+            }),
+            services: std::collections::HashMap::from([(
+                "/example.com".to_string(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                },
+            )]),
+            ..Default::default()
+        });
+        let healthy_local_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/local-example.com-pod".to_string(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
+            network: "".to_string(),
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            services: std::collections::HashMap::from([(
+                "/example.com".to_string(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                },
+            )]),
+            status: xds::istio::workload::WorkloadStatus::Healthy.into(),
+            ..Default::default()
+        });
+        let unhealthy_local_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/local-example.com-pod".to_string(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
+            network: "".to_string(),
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            services: std::collections::HashMap::from([(
+                "/example.com".to_string(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                },
+            )]),
+            status: xds::istio::workload::WorkloadStatus::Unhealthy.into(),
+            ..Default::default()
+        });
+
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                service.clone(),
+                ew_gateway.clone(),
+                remote_workload.clone(),
+                healthy_local_workload.clone(),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::HBONE,
+                hbone_destination: "127.0.0.2:8080",
+                destination: "127.0.0.2:15008",
+            }),
+        )
+        .await;
+
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                service.clone(),
+                ew_gateway.clone(),
+                remote_workload.clone(),
+                unhealthy_local_workload.clone(),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::DOUBLEHBONE,
+                hbone_destination: "example.com:80",
+                destination: "10.22.1.1:15009",
             }),
         )
         .await;
@@ -652,7 +1423,7 @@ mod tests {
                 ..Default::default()
             }),
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "127.0.0.2:80",
             }),
@@ -675,7 +1446,7 @@ mod tests {
                 ..Default::default()
             }),
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "127.0.0.2:80",
                 destination: "127.0.0.2:15008",
             }),
@@ -698,7 +1469,7 @@ mod tests {
                 ..Default::default()
             }),
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "127.0.0.2:80",
             }),
@@ -721,7 +1492,7 @@ mod tests {
                 ..Default::default()
             }),
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "127.0.0.2:80",
                 destination: "127.0.0.2:15008",
             }),
@@ -742,6 +1513,7 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
+                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -750,7 +1522,7 @@ mod tests {
             }),
             // Even though source has a waypoint, we don't use it
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "127.0.0.1:80",
             }),
@@ -771,6 +1543,7 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
+                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -779,7 +1552,7 @@ mod tests {
             }),
             // Should use the waypoint
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "127.0.0.2:80",
                 destination: "127.0.0.10:15008",
             }),
@@ -805,6 +1578,7 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 11].to_vec(),
+                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -813,7 +1587,7 @@ mod tests {
             }),
             // Should use the waypoint
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "[ff06::c3]:80",
                 destination: "127.0.0.11:15008",
             }),
@@ -830,16 +1604,19 @@ mod tests {
                 addresses: vec![XdsNetworkAddress {
                     network: "".to_string(),
                     address: vec![127, 0, 0, 3],
+                    length: None,
                 }],
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 8080,
+                    app_protocol: 0,
                 }],
                 waypoint: Some(xds::istio::workload::GatewayAddress {
                     destination: Some(xds::istio::workload::gateway_address::Destination::Address(
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: [127, 0, 0, 10].to_vec(),
+                            length: None,
                         },
                     )),
                     hbone_mtls_port: 15008,
@@ -848,7 +1625,7 @@ mod tests {
             }),
             // Should use the waypoint
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "127.0.0.3:80",
                 destination: "127.0.0.10:15008",
             }),
@@ -865,10 +1642,12 @@ mod tests {
                 addresses: vec![XdsNetworkAddress {
                     network: "".to_string(),
                     address: vec![127, 0, 0, 3],
+                    length: None,
                 }],
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 8080,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             }),
@@ -889,15 +1668,18 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
+                        length: None,
                     }],
                     ports: vec![
                         Port {
                             service_port: 80,
                             target_port: 0, // named port
+                            app_protocol: 0,
                         },
                         Port {
                             service_port: 8080,
                             target_port: 0, // named port
+                            app_protocol: 0,
                         },
                     ],
                     ..Default::default()
@@ -911,6 +1693,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 80,
                                 target_port: 1234,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -926,6 +1709,7 @@ mod tests {
                             ports: vec![Port {
                                 service_port: 8080,
                                 target_port: 9999,
+                                app_protocol: 0,
                             }],
                         },
                     )]),
@@ -933,7 +1717,7 @@ mod tests {
                 }),
             ],
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "127.0.0.2:1234",
             }),
@@ -950,10 +1734,12 @@ mod tests {
                 addresses: vec![XdsNetworkAddress {
                     network: "".to_string(),
                     address: vec![127, 0, 0, 3],
+                    length: None,
                 }],
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 80,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             }),
@@ -968,6 +1754,7 @@ mod tests {
                         ports: vec![Port {
                             service_port: 80,
                             target_port: 80,
+                            app_protocol: 0,
                         }],
                     },
                 )]),
@@ -989,7 +1776,7 @@ mod tests {
             // Traffic to the service should go to the pod in the service
             Some(ExpectedRequest {
                 destination: "127.0.0.2:80",
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
             }),
         )
@@ -1010,7 +1797,7 @@ mod tests {
             // Traffic to the service should go to the pod in the service
             Some(ExpectedRequest {
                 destination: "127.0.0.2:80",
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
             }),
         )
@@ -1040,7 +1827,7 @@ mod tests {
             "127.0.0.2:80",
             workload.clone(),
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "127.0.0.2:80",
             }),
@@ -1052,7 +1839,7 @@ mod tests {
             "[ff06::c3]:80",
             workload.clone(),
             Some(ExpectedRequest {
-                protocol: Protocol::TCP,
+                protocol: OutboundProtocol::TCP,
                 hbone_destination: "",
                 destination: "[ff06::c3]:80",
             }),
@@ -1083,15 +1870,18 @@ mod tests {
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: vec![127, 0, 0, 3],
+                        length: None,
                     },
                     XdsNetworkAddress {
                         network: "".to_string(),
                         address: "::3".parse::<Ipv6Addr>().unwrap().octets().into(),
+                        length: None,
                     },
                 ],
                 ports: vec![Port {
                     service_port: 80,
                     target_port: 80,
+                    app_protocol: 0,
                 }],
                 ..Default::default()
             };
@@ -1104,7 +1894,7 @@ mod tests {
             "127.0.0.3:80",
             vec![svc(IpFamilies::Ipv6Only), workload.clone()],
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "[ff06::c3]:80",
                 destination: "[ff06::c3]:15008",
             }),
@@ -1116,7 +1906,7 @@ mod tests {
             "127.0.0.3:80",
             vec![svc(IpFamilies::Ipv4Only), workload.clone()],
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "127.0.0.2:80",
                 destination: "127.0.0.2:15008",
             }),
@@ -1128,7 +1918,7 @@ mod tests {
             "127.0.0.3:80",
             vec![svc(IpFamilies::Dual), workload.clone()],
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "127.0.0.2:80",
                 destination: "127.0.0.2:15008",
             }),
@@ -1140,9 +1930,98 @@ mod tests {
             "[::3]:80",
             vec![svc(IpFamilies::Dual), workload.clone()],
             Some(ExpectedRequest {
-                protocol: Protocol::HBONE,
+                protocol: OutboundProtocol::HBONE,
                 hbone_destination: "[ff06::c3]:80",
                 destination: "[ff06::c3]:15008",
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn build_request_passthrough_svc() {
+        run_build_request(
+            "127.0.0.1",
+            "1.2.3.4:80",
+            XdsAddressType::Service(XdsService {
+                hostname: "example.com".to_string(),
+                waypoint: None,
+                load_balancing: Some(LoadBalancing {
+                    mode: xds::istio::workload::load_balancing::Mode::Passthrough.into(),
+                    ..Default::default()
+                }),
+                addresses: vec![
+                    XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![1, 2, 3, 4],
+                        length: None,
+                    },
+                    XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![1, 5, 6, 7],
+                        length: None,
+                    },
+                ],
+                ports: vec![Port {
+                    service_port: 80,
+                    target_port: 80,
+                    app_protocol: 0,
+                }],
+                ..Default::default()
+            }),
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::TCP,
+                hbone_destination: "",
+                destination: "1.2.3.4:80",
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn build_request_passthrough_svc_with_waypoint() {
+        run_build_request(
+            "127.0.0.1",
+            "1.2.3.4:80",
+            XdsAddressType::Service(XdsService {
+                hostname: "example.com".to_string(),
+                waypoint: Some(xds::istio::workload::GatewayAddress {
+                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
+                        XdsNetworkAddress {
+                            network: "".to_string(),
+                            address: [127, 0, 0, 10].to_vec(),
+                            length: None,
+                        },
+                    )),
+                    hbone_mtls_port: 15008,
+                }),
+                load_balancing: Some(LoadBalancing {
+                    mode: xds::istio::workload::load_balancing::Mode::Passthrough.into(),
+                    ..Default::default()
+                }),
+                addresses: vec![
+                    XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![1, 2, 3, 4],
+                        length: None,
+                    },
+                    XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![1, 5, 6, 7],
+                        length: None,
+                    },
+                ],
+                ports: vec![Port {
+                    service_port: 80,
+                    target_port: 80,
+                    app_protocol: 0,
+                }],
+                ..Default::default()
+            }),
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::HBONE,
+                destination: "127.0.0.10:15008",
+                hbone_destination: "1.2.3.4:80",
             }),
         )
         .await;
@@ -1171,9 +2050,115 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_x_forwarded_network_header() {
+        initialize_telemetry();
+
+        // Create a test config with a specific network
+        let cfg = Arc::new(Config {
+            network: "test-network".into(),
+            local_node: Some("local-node".to_string()),
+            ..crate::config::parse_config().unwrap()
+        });
+
+        // Create a source workload and add it to state
+        let source = XdsWorkload {
+            uid: "cluster1//v1/Pod/ns/source-workload".to_string(),
+            name: "source-workload".to_string(),
+            namespace: "ns".to_string(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 1])],
+            node: "local-node".to_string(),
+            ..Default::default()
+        };
+
+        let state = new_proxy_state(&[source], &[], &[]);
+        let sock_fact = Arc::new(crate::proxy::DefaultSocketFactory::default());
+
+        let wi = WorkloadInfo {
+            name: "source-workload".to_string(),
+            namespace: "ns".to_string(),
+            service_account: "default".to_string(),
+        };
+        let local_workload_information = Arc::new(LocalWorkloadInformation::new(
+            Arc::new(wi.clone()),
+            state.clone(),
+            identity::mock::new_secret_manager(Duration::from_secs(10)),
+        ));
+
+        let outbound = OutboundConnection {
+            pi: Arc::new(ProxyInputs {
+                state: state.clone(),
+                cfg: cfg.clone(),
+                metrics: test_proxy_metrics(),
+                socket_factory: sock_fact.clone(),
+                local_workload_information: local_workload_information.clone(),
+                connection_manager: ConnectionManager::default(),
+                resolver: None,
+                disable_inbound_freebind: false,
+                crl_manager: None,
+            }),
+            id: TraceParent::new(),
+            pool: WorkloadHBONEPool::new(
+                cfg.clone(),
+                sock_fact,
+                local_workload_information.clone(),
+                None,
+                test_proxy_metrics(),
+            ),
+            hbone_port: cfg.inbound_addr.port(),
+        };
+
+        // Get the source workload from state
+        let source_workload = outbound
+            .pi
+            .local_workload_information
+            .get_workload()
+            .await
+            .unwrap();
+
+        // Create a minimal test request with required fields
+        let req = Request {
+            protocol: OutboundProtocol::HBONE,
+            source: source_workload,
+            hbone_target_destination: Some(HboneAddress::SocketAddr(
+                "10.0.0.1:8080".parse().unwrap(),
+            )),
+            actual_destination_workload: None,
+            intended_destination_service: None,
+            actual_destination: "10.0.0.1:8080".parse().unwrap(),
+            upstream_sans: vec![],
+            final_sans: vec![],
+        };
+
+        let remote_addr = "127.0.0.1:12345".parse().unwrap();
+
+        // Test the single HBONE case - header should NOT be added when origin_network is None
+        let http_request_no_header = outbound.create_hbone_request(remote_addr, &req, None);
+        assert!(
+            http_request_no_header
+                .headers()
+                .get(X_FORWARDED_NETWORK_HEADER)
+                .is_none(),
+            "x-istio-origin-network header should not be present when origin_network is None (single HBONE)"
+        );
+
+        // Test the double HBONE inner request case - header should be added when network is specified
+        let network = crate::strng::Strng::from("test-network");
+        let http_request_with_header =
+            outbound.create_hbone_request(remote_addr, &req, Some(&network));
+        assert_eq!(
+            http_request_with_header
+                .headers()
+                .get(X_FORWARDED_NETWORK_HEADER)
+                .unwrap(),
+            "test-network",
+            "x-istio-origin-network header should contain the network name for double HBONE inner request"
+        );
+    }
+
     #[derive(PartialEq, Debug)]
     struct ExpectedRequest<'a> {
-        protocol: Protocol,
+        protocol: OutboundProtocol,
         hbone_destination: &'a str,
         destination: &'a str,
     }

@@ -86,6 +86,7 @@ pub struct CertsDump {
     identity: String,
     state: String,
     cert_chain: Vec<CertDump>,
+    root_certs: Vec<CertDump>,
 }
 
 impl Service {
@@ -127,6 +128,8 @@ impl Service {
                 "/debug/pprof/profile" => handle_pprof(req).await,
                 #[cfg(target_os = "linux")]
                 "/debug/pprof/heap" => handle_jemalloc_pprof_heapgen(req).await,
+                #[cfg(target_os = "linux")]
+                "/debug/pprof/heap/profiling" => handle_jemalloc_prof_toggle(req).await,
                 "/quitquitquit" => Ok(handle_server_shutdown(
                     state.shutdown_trigger.clone(),
                     req,
@@ -158,11 +161,16 @@ async fn handle_dashboard(_req: Request<Incoming>) -> Response<Full<Bytes>> {
     let apis = &[
         (
             "debug/pprof/profile",
-            "build profile using the pprof profiler (if supported)",
+            "capture a CPU profile (if supported); \
+             params: seconds (1-300, default 10), frequency in Hz (1-1000, default 100)",
         ),
         (
             "debug/pprof/heap",
             "collect heap profiling data (if supported, requires jmalloc)",
+        ),
+        (
+            "debug/pprof/heap/profiling",
+            "query or toggle heap profiling with ?activate=true|false (requires jmalloc)",
         ),
         ("quitquitquit", "shut down the server"),
         ("config_dump", "dump the current Ztunnel configuration"),
@@ -220,10 +228,12 @@ async fn dump_certs(cert_manager: &SecretManager) -> Vec<CertsDump> {
                 Unavailable(err) => dump.state = format!("Unavailable: {err}"),
                 Available(certs) => {
                     dump.state = "Available".to_string();
-                    dump.cert_chain = std::iter::once(&certs.cert)
-                        .chain(certs.chain.iter())
+                    dump.cert_chain = certs
+                        .cert_and_intermediates()
+                        .iter()
                         .map(dump_cert)
                         .collect();
+                    dump.root_certs = certs.roots.iter().map(dump_cert).collect();
                 }
             };
             dump
@@ -235,14 +245,47 @@ async fn dump_certs(cert_manager: &SecretManager) -> Vec<CertsDump> {
 }
 
 #[cfg(target_os = "linux")]
-async fn handle_pprof(_req: Request<Incoming>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn handle_pprof(req: Request<Incoming>) -> anyhow::Result<Response<Full<Bytes>>> {
+    let qp: HashMap<String, String> = req
+        .uri()
+        .query()
+        .map(|v| {
+            url::form_urlencoded::parse(v.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let seconds = match qp.get("seconds").map(|s| s.parse::<u64>()) {
+        None => 10,
+        Some(Ok(s)) if (1..=300).contains(&s) => s,
+        Some(_) => {
+            return Ok(plaintext_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "invalid seconds value; expected 1-300\n".into(),
+            ));
+        }
+    };
+    // Default matches Go's CPU profiler. Higher rates severely under-report on a
+    // multi-core-busy process: SIGPROF is non-queuing, so expirations coalesce, and
+    // pprof-rs's handler serializes all threads through one lock and drops samples
+    // that arrive while it is held.
+    let frequency = match qp.get("frequency").map(|s| s.parse::<i32>()) {
+        None => 100,
+        Some(Ok(f)) if (1..=1000).contains(&f) => f,
+        Some(_) => {
+            return Ok(plaintext_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "invalid frequency value; expected 1-1000\n".into(),
+            ));
+        }
+    };
+
     use pprof::protos::Message;
     let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(1000)
-        // .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .frequency(frequency)
         .build()?;
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
     let report = guard.report().build()?;
     let profile = report.pprof()?;
 
@@ -382,20 +425,20 @@ fn change_log_level(reset: bool, level: &str) -> Response<Full<Bytes>> {
     if !reset && level.is_empty() {
         return list_loggers();
     }
-    if !level.is_empty() {
-        if let Err(_e) = validate_log_level(level) {
-            // Invalid level provided
-            return plaintext_response(
-                hyper::StatusCode::BAD_REQUEST,
-                format!("Invalid level provided: {}\n{}", level, HELP_STRING),
-            );
-        };
-    }
+    if !level.is_empty()
+        && let Err(_e) = validate_log_level(level)
+    {
+        // Invalid level provided
+        return plaintext_response(
+            hyper::StatusCode::BAD_REQUEST,
+            format!("Invalid level provided: {level}\n{HELP_STRING}"),
+        );
+    };
     match telemetry::set_level(reset, level) {
         Ok(_) => list_loggers(),
         Err(e) => plaintext_response(
             hyper::StatusCode::BAD_REQUEST,
-            format!("Failed to set new level: {}\n{}", e, HELP_STRING),
+            format!("Failed to set new level: {e}\n{HELP_STRING}"),
         ),
     }
 }
@@ -407,14 +450,17 @@ async fn handle_jemalloc_pprof_heapgen(
     let Some(prof_ctrl) = jemalloc_pprof::PROF_CTL.as_ref() else {
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body("jemalloc profiling is not enabled".into())
+            .body("heap profiling is not enabled".into())
             .expect("builder with known status code should not fail"));
     };
     let mut prof_ctl = prof_ctrl.lock().await;
     if !prof_ctl.activated() {
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-            .body("jemalloc not enabled".into())
+            .body(
+                "heap profiling not active; activate with /debug/pprof/heap/profiling?activate=true"
+                    .into(),
+            )
             .expect("builder with known status code should not fail"));
     }
     let pprof = prof_ctl.dump_pprof()?;
@@ -426,6 +472,55 @@ async fn handle_jemalloc_pprof_heapgen(
 
 #[cfg(not(feature = "jemalloc"))]
 async fn handle_jemalloc_pprof_heapgen(
+    _req: Request<Incoming>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    Ok(Response::builder()
+        .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+        .body("jemalloc not enabled".into())
+        .expect("builder with known status code should not fail"))
+}
+
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+async fn handle_jemalloc_prof_toggle(
+    req: Request<Incoming>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let Some(prof_ctrl) = jemalloc_pprof::PROF_CTL.as_ref() else {
+        return Ok(Response::builder()
+            .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+            .body("jemalloc profiling is not enabled".into())
+            .expect("builder with known status code should not fail"));
+    };
+    let qp: HashMap<String, String> = req
+        .uri()
+        .query()
+        .map(|v| {
+            url::form_urlencoded::parse(v.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut prof_ctl = prof_ctrl.lock().await;
+    // Dumps from /debug/pprof/heap only include allocations sampled while
+    // profiling is active; allocations made before activation are not visible.
+    match qp.get("activate").map(String::as_str) {
+        Some("true") => prof_ctl.activate()?,
+        Some("false") => prof_ctl.deactivate()?,
+        Some(v) => {
+            return Ok(plaintext_response(
+                hyper::StatusCode::BAD_REQUEST,
+                format!("invalid activate value {v:?}; expected true or false\n"),
+            ));
+        }
+        None => {}
+    }
+    Ok(plaintext_response(
+        hyper::StatusCode::OK,
+        format!("heap profiling active: {}\n", prof_ctl.activated()),
+    ))
+}
+
+#[cfg(not(feature = "jemalloc"))]
+async fn handle_jemalloc_prof_toggle(
     _req: Request<Incoming>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(Response::builder()
@@ -495,10 +590,18 @@ mod tests {
     // Not really much to test, mostly to make sure things format as expected.
     #[tokio::test(start_paused = true)]
     async fn test_dump_certs() {
+        use super::dump_cert;
+        use crate::tls::mock::TEST_ROOT;
+        use crate::tls::parse_cert;
+
         fn identity(s: impl AsRef<str>) -> identity::Identity {
             use std::str::FromStr;
             identity::Identity::from_str(s.as_ref()).unwrap()
         }
+
+        // Derive root cert expectations dynamically so this test doesn't break when TEST_ROOT is regenerated (mock ca uses this root cert)
+        let root_cert_dump =
+            serde_json::to_value(dump_cert(&parse_cert(TEST_ROOT.to_vec()).unwrap())).unwrap();
 
         let manager = identity::mock::new_secret_manager_cfg(identity::mock::SecretManagerConfig {
             cert_lifetime: Duration::from_secs(7 * 60 * 60),
@@ -542,11 +645,13 @@ mod tests {
         let want = serde_json::json!([
           {
             "certChain": [],
+            "rootCerts": [],
             "identity": "spiffe://error/ns/forgotten/sa/sa-failed",
             "state": "Unavailable: the identity is no longer needed"
           },
           {
             "certChain": [],
+            "rootCerts": [],
             "identity": "spiffe://test/ns/test/sa/sa-pending",
             "state": "Initializing"
           },
@@ -554,17 +659,12 @@ mod tests {
             "certChain": [
               {
                 "expirationTime": "2023-03-11T12:57:26Z",
-                "pem": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNYRENDQVVTZ0F3SUJBZ0lVTDVaZ0toTEI1YUt3YXRuZE1sR25CZWZ3Qkxnd0RRWUpLb1pJaHZjTgpBUUVMQlFBd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oYkRBZUZ3MHlNekF6TVRFd05UVTMKTWpaYUZ3MHlNekF6TVRFeE1qVTNNalphTUJneEZqQVVCZ05WQkFvTURXTnNkWE4wWlhJdWJHOWpZV3d3CldUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DQUFSYXIyQm1JWUFndkptT3JTcENlRlE3OUpQeQo4Y3c0K3pFRThmcXI1N2svdW1NcDVqWFpFR0JwZWRCSVkrcWZtSlBYRWlyYTlFOTJkU21rZks1QUtNV3gKbzJrd1p6QTFCZ05WSFJFRUxqQXNoaXB6Y0dsbVptVTZMeTkwY25WemRGOWtiMjFoYVc0dmJuTXZibUZ0ClpYTndZV05sTDNOaEwzTmhMVEF3RHdZRFZSMFBBUUgvQkFVREF3ZWdBREFkQmdOVkhTVUVGakFVQmdncgpCZ0VGQlFjREFRWUlLd1lCQlFVSEF3SXdEUVlKS29aSWh2Y05BUUVMQlFBRGdnRUJBRWh6aFR1Sk5sY04KVTJZSlVGci9xRFp0SkZRdXU5d3hWZUtNcGRHTXNaWHhkM3RST0xNYzRxS1VuUHFiOGhQdDFXWWRhVTkwCjZnZFNMMnJOQnhSTjZHaXZwekhNNThrbHQ4Sk8zQzNtaCtpbEVsck9XbzRZQUJjRUJKWnZkVnlxL0JrYwo5dlBxMUQyK24xeU1SWjkzbHRDZnhWTXQwajBpV1ZwRkVGTGVkK3pKemEvb2czM0FiRDdtLzV4Rm1GVjYKUlpkK0NZZWV1cldkdU8zbmFGN2Y0eUQ3TnU2Rk9JaFZsdnY5ODV3eFFqeGxIeGZYbzE2N1VCY2Q0MVlpCjJjTE9peWk5SXlEWVhYamttVnFRUGJCZmdrZEZTNWV4VnpkdzMvbXpMMzNmVWErSmVhWFBEZms0eHFrMgpwcG1ZclJsRGRBckZiTG04UGxYcXdBRGUvS2pOMUNZPQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==",
+                "pem": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNXekNDQVVPZ0F3SUJBZ0lVTDVaZ0toTEI1YUt3YXRuZE1sR25CZWZ3Qkxnd0RRWUpLb1pJaHZjTgpBUUVMQlFBd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oYkRBZUZ3MHlNekF6TVRFd05UVTMKTWpaYUZ3MHlNekF6TVRFeE1qVTNNalphTUJneEZqQVVCZ05WQkFvTURXTnNkWE4wWlhJdWJHOWpZV3d3CldUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DQUFSYXIyQm1JWUFndkptT3JTcENlRlE3OUpQeQo4Y3c0K3pFRThmcXI1N2svdW1NcDVqWFpFR0JwZWRCSVkrcWZtSlBYRWlyYTlFOTJkU21rZks1QUtNV3gKbzJnd1pqQTFCZ05WSFJFRUxqQXNoaXB6Y0dsbVptVTZMeTkwY25WemRGOWtiMjFoYVc0dmJuTXZibUZ0ClpYTndZV05sTDNOaEwzTmhMVEF3RGdZRFZSMFBBUUgvQkFRREFnV2dNQjBHQTFVZEpRUVdNQlFHQ0NzRwpBUVVGQndNQkJnZ3JCZ0VGQlFjREFqQU5CZ2txaGtpRzl3MEJBUXNGQUFPQ0FRRUFsSW4xek1jTXdjbi8KUEFoN1JvRGI2dnFzZUx6T1RyU1NWMW5qNWt6aGNMdUU0YUNMNFNWbk54SytYTnJUVXdoU3dOdGVZbXFuCnVKTG5DUVVzdS9nVjVWZUt3OGRlNDErWjYvUVhjSzMwNHZXMVl5d2NMcVNWZWd5QkcvT0NzUndvRjIzSwpVMkg1ZXdKV1RSQi9YWGl2TERkMEZsOGIwTkNCN2ZtcmRsRDlZMXlaU1g2aXJwTk1QT1Y5L1B1ckllUUkKR2hvK2dsYjlIME96Tjc5Z2JudldGbEw0RzZVaTlLbzNmeGZhUWpVVVRWbFdpMlh4VlE0MGR6VHV2cG11Ci9qRVh4M0pOQ01zRU5hb3dNYnFTZTlqck9zd0UwMy80ejJCZjBTbkRkdGRwalloN0xZZkRqWkxldTIweAp6VzlNTFM3NU1qdG4vYjV4bHlXeGFyMWh5MnAxS1E9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==",
                 "serialNumber": "271676055104741785552467469040731750696653685944",
                 "validFrom": "2023-03-11T05:57:26Z"
               },
-              {
-                "expirationTime": "2296-12-24T18:31:28Z",
-                "pem": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURFekNDQWZ1Z0F3SUJBZ0lVQytjLzYwZStGMWVFKzdWcXhuYVdjT09abm1Fd0RRWUpLb1pJaHZjTgpBUUVMQlFBd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oYkRBZ0Z3MHlNekF6TVRFeE9ETXgKTWpoYUdBOHlNamsyTVRJeU5ERTRNekV5T0Zvd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oCmJEQ0NBU0l3RFFZSktvWklodmNOQVFFQkJRQURnZ0VQQURDQ0FRb0NnZ0VCQU1lQ1R4UEp0dWQwVXh3KwpDYWFkZFdEN2ErUUV1UVkrQlBUS0pkbk1lajBzQk1mVU1iVDE2SkxrWU5GZ3JqMVVWSEhjcFNvSUhvY3AKMnNkMzJTWTRiZGJva1Fjb3ArQmp0azU1alE0NktMWXNKZ2IyTnd2WW8xdDhFMWFldEpxRkdWN3JtZVpiCkZZZWFpKzZxN2lNamxiQ0dBdTcvVW5LSnNkR25hSlFnTjhkdTBUMUtEZ2pxS1B5SHFkc3U5a2JwQ3FpRQpYTVJtdzQvQkVoRkd6bUlEMm9VREtCMzZkdVZiZHpTRW01MVF2Z1U1SUxYSWd5VnJlak41Q0ZzQytXK3gKamVPWExFenRmSEZVb3FiM3dXaGtCdUV4bXI4MUoyaEdXOXBVTEoyd2tRZ2RmWFA3Z3RNa0I2RXlLdy94CkllYU5tTHpQSUdyWDAxelFZSWRaVHVEd01ZMENBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGRDhrNGYxYQpya3V3UitVUmhLQWUySVRaS1o3Vk1COEdBMVVkSXdRWU1CYUFGRDhrNGYxYXJrdXdSK1VSaEtBZTJJVFoKS1o3Vk1BOEdBMVVkRXdFQi93UUZNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dFQkFLcm5BZVNzClNTSzMvOHp4K2h6ajZTRlhkSkE5Q1EwMkdFSjdoSHJLaWpHV1ZZZGRhbDlkQWJTNXRMZC8vcUtPOXVJcwpHZXR5L09rMmJSUTZjcXFNbGdkTnozam1tcmJTbFlXbUlYSTB5SEdtQ2lTYXpIc1hWYkVGNkl3eTN0Y1IKNHZvWFdLSUNXUGgrQzJjVGdMbWVaMEV1ekZ4cTR3Wm5DZjQwd0tvQUo5aTFhd1NyQm5FOWpXdG5wNEY0CmhXbkpUcEdreTVkUkFMRTBsLzJBYnJsMzh3Z2ZNOHI0SW90bVBUaEZLbkZlSUhVN2JRMXJZQW9xcGJBaApDdjBCTjVQakFRUldNazZib28zZjBha1MwN25sWUlWcVhoeHFjWW5PZ3drZGxUdFg5TXFHSXEyNm44bjEKTldXd25tS09qTnNrNnFSbXVsRWdlR080dnhUdlNKWWIraFU9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K",
-                "serialNumber": "67955938755654933561614970125599055831405010529",
-                "validFrom": "2023-03-11T18:31:28Z"
-              }
             ],
+            "rootCerts": [root_cert_dump.clone()],
             "identity": "spiffe://trust_domain/ns/namespace/sa/sa-0",
             "state": "Available"
           },
@@ -572,17 +672,12 @@ mod tests {
             "certChain": [
               {
                 "expirationTime": "2023-03-11T13:57:26Z",
-                "pem": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNYRENDQVVTZ0F3SUJBZ0lVSlVGNVVGbU52OVhYQlFWaDFDbFk0VFNLRng4d0RRWUpLb1pJaHZjTgpBUUVMQlFBd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oYkRBZUZ3MHlNekF6TVRFd05qVTMKTWpaYUZ3MHlNekF6TVRFeE16VTNNalphTUJneEZqQVVCZ05WQkFvTURXTnNkWE4wWlhJdWJHOWpZV3d3CldUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DQUFSYXIyQm1JWUFndkptT3JTcENlRlE3OUpQeQo4Y3c0K3pFRThmcXI1N2svdW1NcDVqWFpFR0JwZWRCSVkrcWZtSlBYRWlyYTlFOTJkU21rZks1QUtNV3gKbzJrd1p6QTFCZ05WSFJFRUxqQXNoaXB6Y0dsbVptVTZMeTkwY25WemRGOWtiMjFoYVc0dmJuTXZibUZ0ClpYTndZV05sTDNOaEwzTmhMVEV3RHdZRFZSMFBBUUgvQkFVREF3ZWdBREFkQmdOVkhTVUVGakFVQmdncgpCZ0VGQlFjREFRWUlLd1lCQlFVSEF3SXdEUVlKS29aSWh2Y05BUUVMQlFBRGdnRUJBSWJQa0ZHcG1oV1YKUjVnYmxPUU9kSjZJQ2w5YUpxN20zSVg2MUVBS3loTzZTc0I2aDNvVENRMC9VMEs0S0puS0czY2dPejNqClhPY2RFd25QNFVrcjJiOUxyVU5ES0E2eXN1UzRiejR1alZSN0QzSmUrVFdNMGpVQmJoQUIwY1pObE9ObgpEZUlDK1N0YU03NVAySTlJS0YwcG9QNXMrNnBWeWdkeGhiNTJKZ0FqRU1jRTI2V3lDSjJvOEh4RTcxSjIKREdtOCtaTFdEc2V4M3IrUHdQOTkyc3NFaEl5QUx5NDhKZ0xPTnQ4ZVcvQ296VlpnZURyNFFYVmVBS0NOCndFcisyOGFnSWJkbHZob3hSOTV3VmNIeUdXeHg1emlzS2xyek10andCbTRqdy93OGJ3eDN3RERJOFJNeQpUMnBabzRIaGs4UEdvTmJWUTBmc0tlWUJ2L0g5dE9JPQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==",
+                "pem": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNXekNDQVVPZ0F3SUJBZ0lVSlVGNVVGbU52OVhYQlFWaDFDbFk0VFNLRng4d0RRWUpLb1pJaHZjTgpBUUVMQlFBd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oYkRBZUZ3MHlNekF6TVRFd05qVTMKTWpaYUZ3MHlNekF6TVRFeE16VTNNalphTUJneEZqQVVCZ05WQkFvTURXTnNkWE4wWlhJdWJHOWpZV3d3CldUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DQUFSYXIyQm1JWUFndkptT3JTcENlRlE3OUpQeQo4Y3c0K3pFRThmcXI1N2svdW1NcDVqWFpFR0JwZWRCSVkrcWZtSlBYRWlyYTlFOTJkU21rZks1QUtNV3gKbzJnd1pqQTFCZ05WSFJFRUxqQXNoaXB6Y0dsbVptVTZMeTkwY25WemRGOWtiMjFoYVc0dmJuTXZibUZ0ClpYTndZV05sTDNOaEwzTmhMVEV3RGdZRFZSMFBBUUgvQkFRREFnV2dNQjBHQTFVZEpRUVdNQlFHQ0NzRwpBUVVGQndNQkJnZ3JCZ0VGQlFjREFqQU5CZ2txaGtpRzl3MEJBUXNGQUFPQ0FRRUFtZ2g1WENwMGp6OWEKS3NvTzZBUlBVWmlKbnhDY2xobHlleUJpbkE1cEFkY0F4V2hNN2xMdklxZXNCT3hpRFdhbFR0Z2QzV29OClJGak1VMUNOa0RmQWRoZDhLSTVoaCtpS0Z3eitYK3JIMThSM0c4SDAyQTZWMnpuYVdGald0a1dvc3c4eQpySHlIYjJBaThXakRVV1dwQ21KL0M3ZUJuVEl3OHMrM2ZMZ2o4Rm5rOVZwcjdSNEovc3ppcGVoczZyRHMKQ1pCQzFKVVA0cXovUis1L3VPWHE3cnBHY05SQVlibXVZNllKbXRWVUxKRXl3THFtUjJCckVvKzFZN0VkCkpxRWFPSUdFTEVrdENNazBvZUhkRmZoWWlqZXdmRXJVbVJFSzM2Yy8xY01XMk44MFlkVUMzd1UyWHlZdwpqWUswdkxWeng3U1Q4TmcwL0xlYUdJWGtrQW1PQ3c9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==",
                 "serialNumber": "212692774886610945930036647276614034927450199839",
                 "validFrom": "2023-03-11T06:57:26Z"
               },
-              {
-                "expirationTime": "2296-12-24T18:31:28Z",
-                "pem": "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURFekNDQWZ1Z0F3SUJBZ0lVQytjLzYwZStGMWVFKzdWcXhuYVdjT09abm1Fd0RRWUpLb1pJaHZjTgpBUUVMQlFBd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oYkRBZ0Z3MHlNekF6TVRFeE9ETXgKTWpoYUdBOHlNamsyTVRJeU5ERTRNekV5T0Zvd0dERVdNQlFHQTFVRUNnd05ZMngxYzNSbGNpNXNiMk5oCmJEQ0NBU0l3RFFZSktvWklodmNOQVFFQkJRQURnZ0VQQURDQ0FRb0NnZ0VCQU1lQ1R4UEp0dWQwVXh3KwpDYWFkZFdEN2ErUUV1UVkrQlBUS0pkbk1lajBzQk1mVU1iVDE2SkxrWU5GZ3JqMVVWSEhjcFNvSUhvY3AKMnNkMzJTWTRiZGJva1Fjb3ArQmp0azU1alE0NktMWXNKZ2IyTnd2WW8xdDhFMWFldEpxRkdWN3JtZVpiCkZZZWFpKzZxN2lNamxiQ0dBdTcvVW5LSnNkR25hSlFnTjhkdTBUMUtEZ2pxS1B5SHFkc3U5a2JwQ3FpRQpYTVJtdzQvQkVoRkd6bUlEMm9VREtCMzZkdVZiZHpTRW01MVF2Z1U1SUxYSWd5VnJlak41Q0ZzQytXK3gKamVPWExFenRmSEZVb3FiM3dXaGtCdUV4bXI4MUoyaEdXOXBVTEoyd2tRZ2RmWFA3Z3RNa0I2RXlLdy94CkllYU5tTHpQSUdyWDAxelFZSWRaVHVEd01ZMENBd0VBQWFOVE1GRXdIUVlEVlIwT0JCWUVGRDhrNGYxYQpya3V3UitVUmhLQWUySVRaS1o3Vk1COEdBMVVkSXdRWU1CYUFGRDhrNGYxYXJrdXdSK1VSaEtBZTJJVFoKS1o3Vk1BOEdBMVVkRXdFQi93UUZNQU1CQWY4d0RRWUpLb1pJaHZjTkFRRUxCUUFEZ2dFQkFLcm5BZVNzClNTSzMvOHp4K2h6ajZTRlhkSkE5Q1EwMkdFSjdoSHJLaWpHV1ZZZGRhbDlkQWJTNXRMZC8vcUtPOXVJcwpHZXR5L09rMmJSUTZjcXFNbGdkTnozam1tcmJTbFlXbUlYSTB5SEdtQ2lTYXpIc1hWYkVGNkl3eTN0Y1IKNHZvWFdLSUNXUGgrQzJjVGdMbWVaMEV1ekZ4cTR3Wm5DZjQwd0tvQUo5aTFhd1NyQm5FOWpXdG5wNEY0CmhXbkpUcEdreTVkUkFMRTBsLzJBYnJsMzh3Z2ZNOHI0SW90bVBUaEZLbkZlSUhVN2JRMXJZQW9xcGJBaApDdjBCTjVQakFRUldNazZib28zZjBha1MwN25sWUlWcVhoeHFjWW5PZ3drZGxUdFg5TXFHSXEyNm44bjEKTldXd25tS09qTnNrNnFSbXVsRWdlR080dnhUdlNKWWIraFU9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K",
-                "serialNumber": "67955938755654933561614970125599055831405010529",
-                "validFrom": "2023-03-11T18:31:28Z"
-              }
             ],
+            "rootCerts": [root_cert_dump.clone()],
             "identity": "spiffe://trust_domain/ns/namespace/sa/sa-1",
             "state": "Available"
           }
@@ -616,6 +711,7 @@ mod tests {
                 destination: Some(XdsDestination::Address(XdsNetworkAddress {
                     network: "defaultnw".to_string(),
                     address: [127, 0, 0, 10].to_vec(),
+                    length: None,
                 })),
                 hbone_mtls_port: 15008,
             }),
@@ -623,6 +719,7 @@ mod tests {
                 destination: Some(XdsDestination::Address(XdsNetworkAddress {
                     network: "defaultnw".to_string(),
                     address: [127, 0, 0, 11].to_vec(),
+                    length: None,
                 })),
                 hbone_mtls_port: 15008,
             }),
@@ -650,6 +747,7 @@ mod tests {
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             )]),
@@ -670,13 +768,16 @@ mod tests {
             addresses: vec![XdsNetworkAddress {
                 network: "defaultnw".to_string(),
                 address: [127, 0, 1, 1].to_vec(),
+                length: None,
             }],
             ports: vec![XdsPort {
                 service_port: 80,
                 target_port: 80,
+                app_protocol: 0,
             }],
             subject_alt_names: vec!["SAN1".to_string(), "SAN2".to_string()],
             waypoint: None,
+            weighted_waypoints: vec![],
             load_balancing: Some(XdsLoadBalancing {
                 routing_preference: vec![1, 2],
                 mode: 1,
@@ -684,6 +785,9 @@ mod tests {
             }), // ..Default::default() // intentionally don't default. we want all fields populated
             ip_families: 0,
             extensions: Default::default(),
+            canonical: true,
+            visibility: 0,
+            ingress_use_waypoint: false,
         };
 
         let auth = XdsAuthorization {
@@ -736,9 +840,12 @@ mod tests {
                                 "spiffe://cluster.local/ns/ns/sa/not-sa".to_string(),
                             )),
                         }],
+                        extensions: vec![],
                     }],
                 }],
             }],
+            dry_run: false,
+            extensions: vec![],
             // ..Default::default() // intentionally don't default. we want all fields populated
         };
 
@@ -801,14 +908,14 @@ mod tests {
         let resp_str = get_response_str(resp).await;
         assert_eq!(
             resp_str,
-            "current log level is hickory_server::server::server_future=off,info\n"
+            "current log level is hickory_server::server=off,info\n"
         );
 
         let resp = change_log_level(true, "");
         let resp_str = get_response_str(resp).await;
         assert_eq!(
             resp_str,
-            "current log level is hickory_server::server::server_future=off,info\n"
+            "current log level is hickory_server::server=off,info\n"
         );
 
         let resp = change_log_level(true, "invalid_level");
@@ -822,49 +929,40 @@ mod tests {
         let resp_str = get_response_str(resp).await;
         assert_eq!(
             resp_str,
-            "current log level is hickory_server::server::server_future=off,debug\n"
+            "current log level is hickory_server::server=off,debug\n"
         );
 
         let resp = change_log_level(true, "access=debug,info");
         let resp_str = get_response_str(resp).await;
         assert_eq!(
             resp_str,
-            "current log level is hickory_server::server::server_future=off,access=debug,info\n"
+            "current log level is hickory_server::server=off,access=debug,info\n"
         );
 
         let resp = change_log_level(true, "warn");
         let resp_str = get_response_str(resp).await;
         assert_eq!(
             resp_str,
-            "current log level is hickory_server::server::server_future=off,warn\n"
+            "current log level is hickory_server::server=off,warn\n"
         );
 
         let resp = change_log_level(true, "error");
         let resp_str = get_response_str(resp).await;
         assert_eq!(
             resp_str,
-            "current log level is hickory_server::server::server_future=off,error\n"
+            "current log level is hickory_server::server=off,error\n"
         );
 
         let resp = change_log_level(true, "trace");
         let resp_str = get_response_str(resp).await;
-        assert!(
-            resp_str
-                .contains("current log level is hickory_server::server::server_future=off,trace\n")
-        );
+        assert!(resp_str.contains("current log level is hickory_server::server=off,trace\n"));
 
         let resp = change_log_level(true, "info");
         let resp_str = get_response_str(resp).await;
-        assert!(
-            resp_str
-                .contains("current log level is hickory_server::server::server_future=off,info\n")
-        );
+        assert!(resp_str.contains("current log level is hickory_server::server=off,info\n"));
 
         let resp = change_log_level(true, "off");
         let resp_str = get_response_str(resp).await;
-        assert!(
-            resp_str
-                .contains("current log level is hickory_server::server::server_future=off,off\n")
-        );
+        assert!(resp_str.contains("current log level is hickory_server::server=off,off\n"));
     }
 }

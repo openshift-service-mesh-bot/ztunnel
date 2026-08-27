@@ -14,10 +14,12 @@
 
 mod certificate;
 mod control;
+pub mod crl;
 pub mod csr;
 mod lib;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
+pub mod revocation;
 mod workload;
 
 use std::sync::Arc;

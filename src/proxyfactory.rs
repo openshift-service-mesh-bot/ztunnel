@@ -15,6 +15,7 @@
 use crate::config;
 use crate::identity::SecretManager;
 use crate::state::{DemandProxyState, WorkloadInfo};
+use crate::tls;
 use std::sync::Arc;
 use tracing::error;
 
@@ -22,9 +23,8 @@ use crate::dns;
 use crate::drain::DrainWatcher;
 
 use crate::proxy::connection_manager::ConnectionManager;
+use crate::proxy::{DefaultSocketFactory, Proxy, inbound::Inbound};
 use crate::proxy::{Error, LocalWorkloadInformation, Metrics};
-
-use crate::proxy::Proxy;
 
 // Proxy factory creates ztunnel proxies using a socket factory.
 // this allows us to create our proxies the same way in regular mode and in inpod mode.
@@ -35,6 +35,7 @@ pub struct ProxyFactory {
     proxy_metrics: Arc<Metrics>,
     dns_metrics: Option<Arc<dns::Metrics>>,
     drain: DrainWatcher,
+    crl_manager: Option<Arc<tls::crl::CrlManager>>,
 }
 
 impl ProxyFactory {
@@ -56,6 +57,36 @@ impl ProxyFactory {
             }
         };
 
+        // Initialize CRL manager if crl_path is set
+        let crl_manager = if let Some(crl_path) = &config.crl_path {
+            match tls::crl::CrlManager::new(crl_path.clone(), proxy_metrics.clone()) {
+                Ok(manager) => {
+                    let manager_arc = Arc::new(manager);
+
+                    if let Err(e) = manager_arc.start_file_watcher() {
+                        tracing::warn!(
+                            "crl file watcher could not be started: {}. \
+                            crl validation will continue with current file, but \
+                            crl updates will require restarting ztunnel.",
+                            e
+                        );
+                    }
+
+                    Some(manager_arc)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = ?crl_path,
+                        error = %e,
+                        "failed to initialize crl manager"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(ProxyFactory {
             config,
             state,
@@ -63,6 +94,7 @@ impl ProxyFactory {
             proxy_metrics,
             dns_metrics,
             drain,
+            crl_manager,
         })
     }
 
@@ -113,6 +145,8 @@ impl ProxyFactory {
                 drain.clone(),
                 socket_factory.as_ref(),
                 local_workload_information.as_fetcher(),
+                self.config.prefered_service_namespace.clone(),
+                self.config.ipv6_enabled,
             )
             .await?;
             resolver = Some(server.resolver());
@@ -130,12 +164,61 @@ impl ProxyFactory {
                 socket_factory.clone(),
                 resolver,
                 local_workload_information,
+                false,
+                self.crl_manager.clone(),
             );
             result.connection_manager = Some(cm);
             result.proxy = Some(Proxy::from_inputs(pi, drain).await?);
         }
 
         Ok(result)
+    }
+
+    /// Creates an inbound listener specifically for ztunnel's own internal endpoints (metrics).
+    /// This allows ztunnel to act as its own workload, enforcing policies on traffic directed to itself.
+    /// This is distinct from the main inbound listener which handles traffic for other workloads proxied by ztunnel.
+    pub async fn create_ztunnel_self_proxy_listener(
+        &self,
+    ) -> Result<Option<crate::proxy::inbound::Inbound>, Error> {
+        if self.config.proxy_mode != config::ProxyMode::Shared {
+            return Ok(None);
+        }
+
+        if let (Some(ztunnel_identity), Some(ztunnel_workload)) =
+            (&self.config.ztunnel_identity, &self.config.ztunnel_workload)
+        {
+            tracing::info!(
+                "creating ztunnel self-proxy listener with identity: {:?}",
+                ztunnel_identity
+            );
+
+            let local_workload_information = Arc::new(LocalWorkloadInformation::new(
+                Arc::new(ztunnel_workload.clone()),
+                self.state.clone(),
+                self.cert_manager.clone(),
+            ));
+
+            let socket_factory = Arc::new(DefaultSocketFactory(self.config.socket_config));
+
+            let cm = ConnectionManager::default();
+
+            let pi = crate::proxy::ProxyInputs::new(
+                self.config.clone(),
+                cm.clone(),
+                self.state.clone(),
+                self.proxy_metrics.clone(),
+                socket_factory,
+                None,
+                local_workload_information,
+                true,
+                self.crl_manager.clone(),
+            );
+
+            let inbound = Inbound::new(pi, self.drain.clone()).await?;
+            Ok(Some(inbound))
+        } else {
+            Ok(None)
+        }
     }
 }
 

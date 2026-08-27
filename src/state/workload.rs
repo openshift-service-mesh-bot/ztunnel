@@ -14,11 +14,13 @@
 
 use crate::identity::Identity;
 
+use crate::baggage::Baggage;
 use crate::state::WorkloadInfo;
 use crate::strng::Strng;
 use crate::xds::istio::workload::{Port, PortList};
 use crate::{strng, xds};
 use bytes::Bytes;
+use ipnet::IpNet;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -36,11 +38,12 @@ use std::sync::Arc;
 use std::{fmt, net};
 use thiserror::Error;
 use tokio::sync::watch::{Receiver, Sender};
-use tracing::{error, trace};
+use tracing::trace;
 use xds::istio::workload::ApplicationTunnel as XdsApplicationTunnel;
 use xds::istio::workload::GatewayAddress as XdsGatewayAddress;
 use xds::istio::workload::Workload as XdsWorkload;
 
+// The protocol that the final workload expects
 #[derive(
     Default,
     Debug,
@@ -54,17 +57,53 @@ use xds::istio::workload::Workload as XdsWorkload;
     serde::Serialize,
     serde::Deserialize,
 )]
-pub enum Protocol {
+pub enum InboundProtocol {
     #[default]
     TCP,
     HBONE,
 }
 
-impl From<xds::istio::workload::TunnelProtocol> for Protocol {
-    fn from(value: xds::istio::workload::TunnelProtocol) -> Self {
+impl TryFrom<xds::istio::workload::TunnelProtocol> for InboundProtocol {
+    type Error = WorkloadError;
+
+    fn try_from(value: xds::istio::workload::TunnelProtocol) -> Result<Self, Self::Error> {
         match value {
-            xds::istio::workload::TunnelProtocol::Hbone => Protocol::HBONE,
-            xds::istio::workload::TunnelProtocol::None => Protocol::TCP,
+            xds::istio::workload::TunnelProtocol::Hbone => Ok(InboundProtocol::HBONE),
+            xds::istio::workload::TunnelProtocol::None => Ok(InboundProtocol::TCP),
+            xds::istio::workload::TunnelProtocol::LegacyIstioMtls => Err(WorkloadError::EnumParse(
+                "unsupported tunnel protocol: legacy istio mtls".to_string(),
+            )),
+        }
+    }
+}
+
+// The protocol that the sender should use to send data. Can be different from ServerProtocol when there is a
+// proxy in the middle (e.g. e/w gateway with double hbone).
+#[derive(
+    Default,
+    Debug,
+    Hash,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Clone,
+    Copy,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum OutboundProtocol {
+    #[default]
+    TCP,
+    HBONE,
+    DOUBLEHBONE,
+}
+
+impl From<InboundProtocol> for OutboundProtocol {
+    fn from(value: InboundProtocol) -> Self {
+        match value {
+            InboundProtocol::HBONE => OutboundProtocol::HBONE,
+            InboundProtocol::TCP => OutboundProtocol::TCP,
         }
     }
 }
@@ -198,7 +237,7 @@ pub struct Workload {
     pub network_gateway: Option<GatewayAddress>,
 
     #[serde(default)]
-    pub protocol: Protocol,
+    pub protocol: InboundProtocol,
     #[serde(default)]
     pub network_mode: NetworkMode,
 
@@ -269,6 +308,19 @@ impl Workload {
             service_account: self.service_account.clone(),
         }
     }
+
+    pub fn baggage(&self) -> Baggage {
+        Baggage {
+            cluster_id: (!self.cluster_id.is_empty()).then_some(self.cluster_id.clone()),
+            namespace: (!self.namespace.is_empty()).then_some(self.namespace.clone()),
+            workload_name: (!self.workload_name.is_empty()).then_some(self.workload_name.clone()),
+            service_name: (!self.canonical_name.is_empty()).then_some(self.canonical_name.clone()),
+            revision: (!self.canonical_revision.is_empty())
+                .then_some(self.canonical_revision.clone()),
+            region: (!self.locality.region.is_empty()).then_some(self.locality.region.clone()),
+            zone: (!self.locality.zone.is_empty()).then_some(self.locality.zone.clone()),
+        }
+    }
 }
 
 impl fmt::Display for Workload {
@@ -313,6 +365,7 @@ impl From<HashMap<u16, u16>> for PortList {
                 .map(|(k, v)| Port {
                     service_port: *k as u32,
                     target_port: *v as u32,
+                    app_protocol: 0,
                 })
                 .collect(),
         }
@@ -418,9 +471,9 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
             waypoint: wp,
             network_gateway: network_gw,
 
-            protocol: Protocol::from(xds::istio::workload::TunnelProtocol::try_from(
+            protocol: InboundProtocol::try_from(xds::istio::workload::TunnelProtocol::try_from(
                 resource.tunnel_protocol,
-            )?),
+            )?)?,
             network_mode: NetworkMode::from(xds::istio::workload::NetworkMode::try_from(
                 resource.network_mode,
             )?),
@@ -629,6 +682,24 @@ pub fn network_addr(network: Strng, vip: IpAddr) -> NetworkAddress {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Hash, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NetworkCidr {
+    pub network: Strng,
+    pub cidr: IpNet,
+}
+
+impl fmt::Display for NetworkCidr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.network)?;
+        f.write_char('/')?;
+        fmt::Display::fmt(&self.cidr, f)
+    }
+}
+
+pub fn network_cidr(network: Strng, cidr: IpNet) -> NetworkCidr {
+    NetworkCidr { network, cidr }
+}
+
 /// WorkloadIdentity provides information about a workloads identity. This is used in place of Identity
 /// in places where we do not have the full identity (no trust domain) and know we are working with workloads specifically.
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -723,7 +794,7 @@ impl WorkloadByAddr {
                     let is_pod = w.uid.contains("//Pod/");
                     // We fallback to looking for HBONE -- a resource marked as in the mesh is likely
                     // to have more useful context than one not in the mesh.
-                    let is_hbone = w.protocol == Protocol::HBONE;
+                    let is_hbone = w.protocol == InboundProtocol::HBONE;
                     match (is_pod, is_hbone) {
                         (true, true) => 3,
                         (true, false) => 2,
@@ -793,10 +864,9 @@ impl WorkloadStore {
                     for wip in prev.workload_ips.iter() {
                         if let Entry::Occupied(mut o) =
                             self.by_addr.entry(network_addr(prev.network.clone(), *wip))
+                            && o.get_mut().remove_uid(prev.uid.clone())
                         {
-                            if o.get_mut().remove_uid(prev.uid.clone()) {
-                                o.remove();
-                            }
+                            o.remove();
                         }
                     }
                 }
@@ -874,8 +944,9 @@ pub enum WorkloadError {
 mod tests {
     use super::*;
     use crate::config::ConfigSource;
-    use crate::state::{DemandProxyState, ProxyState, ServiceResolutionMode};
+    use crate::state::{DemandProxyState, ProxyState, ServiceResolutionMode, UpstreamDestination};
     use crate::test_helpers::helpers::initialize_telemetry;
+    use crate::test_helpers::{LOCALHOST_YAML, temp_file_with_content};
     use crate::xds::istio::workload::PortList as XdsPortList;
     use crate::xds::istio::workload::Service as XdsService;
     use crate::xds::istio::workload::WorkloadStatus as XdsStatus;
@@ -992,12 +1063,13 @@ mod tests {
                 ports: vec![XdsPort {
                     service_port: 80,
                     target_port: 8080,
+                    app_protocol: 0,
                 }],
             },
         )]);
 
-        let uid1 = format!("cluster1//v1/Pod/default/my-pod/{:?}", ip1);
-        let uid2 = format!("cluster1//v1/Pod/default/my-pod/{:?}", ip2);
+        let uid1 = format!("cluster1//v1/Pod/default/my-pod/{ip1:?}");
+        let uid2 = format!("cluster1//v1/Pod/default/my-pod/{ip2:?}");
 
         updater
             .insert_workload(
@@ -1082,16 +1154,22 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 80,
+                        app_protocol: 0,
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    canonical: true,
+                    visibility: 0,
+                    ingress_use_waypoint: false,
                 },
             )
             .unwrap();
@@ -1111,21 +1189,28 @@ mod tests {
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: vip1.octets().to_vec(), // old endpoints associated with this address should be carried over
+                            length: None,
                         },
                         XdsNetworkAddress {
                             network: "".to_string(),
                             address: vip2.octets().to_vec(), // new address just to test upsert
+                            length: None,
                         },
                     ],
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 80,
+                        app_protocol: 0,
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    canonical: true,
+                    visibility: 0,
+                    ingress_use_waypoint: false,
                 },
             )
             .unwrap();
@@ -1151,10 +1236,13 @@ mod tests {
                 .read()
                 .unwrap()
                 .services
-                .get_by_vip(&NetworkAddress {
-                    network: strng::EMPTY,
-                    address: IpAddr::V4(vip1),
-                })
+                .get_best_by_vip(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: IpAddr::V4(vip1),
+                    },
+                    Some(&"ns".into())
+                )
                 .unwrap()),
         );
 
@@ -1173,16 +1261,22 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 80,
+                        app_protocol: 0,
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    canonical: true,
+                    visibility: 0,
+                    ingress_use_waypoint: false,
                 },
             )
             .unwrap();
@@ -1224,10 +1318,13 @@ mod tests {
                 .read()
                 .unwrap()
                 .services
-                .get_by_vip(&NetworkAddress {
-                    network: strng::EMPTY,
-                    address: IpAddr::V4(vip1),
-                })
+                .get_best_by_vip(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: IpAddr::V4(vip1),
+                    },
+                    Some(&"ns".into())
+                )
                 .unwrap()),
         );
 
@@ -1251,10 +1348,13 @@ mod tests {
                 .read()
                 .unwrap()
                 .services
-                .get_by_vip(&NetworkAddress {
-                    network: strng::EMPTY,
-                    address: IpAddr::V4(vip1),
-                })
+                .get_best_by_vip(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: IpAddr::V4(vip1),
+                    },
+                    Some(&"ns".into())
+                )
                 .unwrap()),
         );
 
@@ -1431,6 +1531,7 @@ mod tests {
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             ),
@@ -1440,6 +1541,7 @@ mod tests {
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             ),
@@ -1484,16 +1586,22 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 80,
+                        app_protocol: 0,
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    canonical: true,
+                    visibility: 0,
+                    ingress_use_waypoint: false,
                 },
             )
             .unwrap();
@@ -1507,13 +1615,16 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip2.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 80,
+                        app_protocol: 0,
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: Some(LoadBalancing {
                         routing_preference: vec![],
                         mode: 0,
@@ -1521,6 +1632,9 @@ mod tests {
                     }),
                     ip_families: 0,
                     extensions: Default::default(),
+                    canonical: true,
+                    visibility: 0,
+                    ingress_use_waypoint: false,
                 },
             )
             .unwrap();
@@ -1558,13 +1672,16 @@ mod tests {
             addresses: vec![XdsNetworkAddress {
                 network: "".to_string(),
                 address: vip2.octets().to_vec(),
+                length: None,
             }],
             ports: vec![XdsPort {
                 service_port: 80,
                 target_port: 80,
+                app_protocol: 0,
             }],
             subject_alt_names: vec![],
             waypoint: None,
+            weighted_waypoints: vec![],
             load_balancing: Some(LoadBalancing {
                 routing_preference: vec![],
                 mode: 0,
@@ -1572,6 +1689,9 @@ mod tests {
             }),
             ip_families: 0,
             extensions: Default::default(),
+            canonical: true,
+            visibility: 0,
+            ingress_use_waypoint: false,
         };
         updater
             .insert_service(
@@ -1583,16 +1703,22 @@ mod tests {
                     addresses: vec![XdsNetworkAddress {
                         network: "".to_string(),
                         address: vip1.octets().to_vec(),
+                        length: None,
                     }],
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 80,
+                        app_protocol: 0,
                     }],
                     subject_alt_names: vec![],
                     waypoint: None,
+                    weighted_waypoints: vec![],
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    canonical: true,
+                    visibility: 0,
+                    ingress_use_waypoint: false,
                 },
             )
             .unwrap();
@@ -1607,6 +1733,7 @@ mod tests {
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             ),
@@ -1616,6 +1743,7 @@ mod tests {
                     ports: vec![XdsPort {
                         service_port: 80,
                         target_port: 8080,
+                        app_protocol: 0,
                     }],
                 },
             ),
@@ -1702,7 +1830,7 @@ mod tests {
 
         let xds_ip1 = Bytes::copy_from_slice(&[127, 0, 0, 1]);
         let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let uid1 = format!("cluster1//v1/Pod/default/my-pod/{:?}", ip1);
+        let uid1 = format!("cluster1//v1/Pod/default/my-pod/{ip1:?}");
 
         let services = HashMap::from([(
             "ns/svc1.ns.svc.cluster.local".to_string(),
@@ -1710,6 +1838,7 @@ mod tests {
                 ports: vec![XdsPort {
                     service_port: 80,
                     target_port: 8080,
+                    app_protocol: 0,
                 }],
             },
         )]);
@@ -1796,12 +1925,14 @@ mod tests {
         .try_into()
         .unwrap();
         for _ in 0..1000 {
-            if let Some((workload, _, _)) = state.state.read().unwrap().find_upstream(
-                strng::EMPTY,
-                &wl,
-                "127.0.1.1:80".parse().unwrap(),
-                ServiceResolutionMode::Standard,
-            ) {
+            if let Some(UpstreamDestination::UpstreamParts(workload, _, _)) =
+                state.state.read().unwrap().find_upstream(
+                    strng::EMPTY,
+                    &wl,
+                    "127.0.1.1:80".parse().unwrap(),
+                    ServiceResolutionMode::Standard,
+                )
+            {
                 let n = &workload.name; // borrow name instead of cloning
                 found.insert(n.to_string()); // insert an owned copy of the borrowed n
                 wants.remove(&n.to_string()); // remove using the borrow
@@ -1817,11 +1948,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_client() {
-        let cfg = ConfigSource::File(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("examples")
-                .join("localhost.yaml"),
-        );
+        let config_file = temp_file_with_content(LOCALHOST_YAML).unwrap();
+        let cfg = ConfigSource::File(config_file.path().to_path_buf());
         let (state, demand, _) = setup_test();
         let local_client = LocalClient {
             cfg,
@@ -1839,17 +1967,16 @@ mod tests {
         // Make sure we get a valid workload
         assert!(wl.is_some());
         assert_eq!(wl.as_ref().unwrap().service_account, "default");
-        let (_, port, svc) = demand
-            .state
-            .read()
-            .unwrap()
-            .find_upstream(
-                strng::EMPTY,
-                wl.as_ref().unwrap(),
-                "127.10.0.1:80".parse().unwrap(),
-                ServiceResolutionMode::Standard,
-            )
-            .expect("should get");
+
+        let (port, svc) = match demand.state.read().unwrap().find_upstream(
+            strng::EMPTY,
+            wl.as_ref().unwrap(),
+            "127.10.0.1:80".parse().unwrap(),
+            ServiceResolutionMode::Standard,
+        ) {
+            Some(UpstreamDestination::UpstreamParts(_, port, svc)) => (port, svc),
+            _ => panic!("should get"),
+        };
         // Make sure we get a valid VIP
         assert_eq!(port, 8080);
         assert_eq!(
@@ -1858,17 +1985,15 @@ mod tests {
         );
 
         // test that we can have a service in another network than workloads it selects
-        let (_, port, _) = demand
-            .state
-            .read()
-            .unwrap()
-            .find_upstream(
-                "remote".into(),
-                wl.as_ref().unwrap(),
-                "127.10.0.2:80".parse().unwrap(),
-                ServiceResolutionMode::Standard,
-            )
-            .expect("should get");
+        let port = match demand.state.read().unwrap().find_upstream(
+            "remote".into(),
+            wl.as_ref().unwrap(),
+            "127.10.0.2:80".parse().unwrap(),
+            ServiceResolutionMode::Standard,
+        ) {
+            Some(UpstreamDestination::UpstreamParts(_, port, _)) => port,
+            _ => panic!("should get"),
+        };
         // Make sure we get a valid VIP
         assert_eq!(port, 8080);
     }

@@ -22,14 +22,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use http_body_util::BodyExt;
+use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZstdDecoder};
+use http::header::CONTENT_ENCODING;
 use http_body_util::Empty;
+use http_body_util::{BodyExt, BodyStream};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response};
 use itertools::Itertools;
 use prometheus_parse::Scrape;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
+use tokio_stream::StreamExt;
+use tokio_util::io::StreamReader;
 use tracing::info;
 
 use crate::app::Bound;
@@ -50,8 +54,10 @@ pub struct TestApp {
     pub udp_dns_proxy_address: Option<SocketAddr>,
     pub cert_manager: Arc<SecretManager>,
 
+    #[cfg(target_os = "linux")]
     pub namespace: Option<super::netns::Namespace>,
     pub shutdown: ShutdownTrigger,
+    pub ztunnel_identity: Option<identity::Identity>,
 }
 
 impl From<(&Bound, Arc<SecretManager>)> for TestApp {
@@ -64,8 +70,10 @@ impl From<(&Bound, Arc<SecretManager>)> for TestApp {
             tcp_dns_proxy_address: app.tcp_dns_proxy_address,
             udp_dns_proxy_address: app.udp_dns_proxy_address,
             cert_manager,
+            #[cfg(target_os = "linux")]
             namespace: None,
             shutdown: app.shutdown.trigger(),
+            ztunnel_identity: None,
         }
     }
 }
@@ -103,7 +111,7 @@ impl TestApp {
         let get_resp = move || async move {
             let req = Request::builder()
                 .method(Method::GET)
-                .uri(format!("http://localhost:{}/{path}", port))
+                .uri(format!("http://localhost:{port}/{path}"))
                 .header("content-type", "application/json")
                 .body(Empty::<Bytes>::new())
                 .unwrap();
@@ -111,6 +119,7 @@ impl TestApp {
             Ok(client.request(req).await?)
         };
 
+        #[cfg(target_os = "linux")]
         match self.namespace {
             Some(ref _ns) => {
                 // TODO: if this is needed, do something like admin_request_body.
@@ -120,6 +129,8 @@ impl TestApp {
             }
             None => get_resp().await,
         }
+        #[cfg(not(target_os = "linux"))]
+        get_resp().await
     }
     pub async fn admin_request_body(&self, path: &str) -> anyhow::Result<Bytes> {
         let port = self.admin_address.port();
@@ -128,7 +139,7 @@ impl TestApp {
         let get_resp = move || async move {
             let req = Request::builder()
                 .method(Method::GET)
-                .uri(format!("http://localhost:{}/{path}", port))
+                .uri(format!("http://localhost:{port}/{path}"))
                 .header("content-type", "application/json")
                 .body(Empty::<Bytes>::new())
                 .unwrap();
@@ -137,27 +148,76 @@ impl TestApp {
             Ok::<_, anyhow::Error>(res.collect().await?.to_bytes())
         };
 
+        #[cfg(target_os = "linux")]
         match self.namespace {
             Some(ref ns) => ns.clone().run(get_resp)?.join().unwrap(),
             None => get_resp().await,
         }
+        #[cfg(not(target_os = "linux"))]
+        get_resp().await
     }
 
     pub async fn metrics(&self) -> anyhow::Result<ParsedMetrics> {
+        let text = self.get_metrics("").await?;
+        let iter = text.lines().map(|x| Ok::<_, io::Error>(x.to_string()));
+        let scrape = prometheus_parse::Scrape::parse(iter).unwrap();
+        Ok(ParsedMetrics { scrape })
+    }
+
+    pub async fn get_metrics(&self, encoding: &str) -> anyhow::Result<String> {
         let req = Request::builder()
             .method(Method::GET)
             .uri(format!("http://{}/metrics", self.metrics_address))
             .header("content-type", "application/json")
+            .header("accept-encoding", encoding)
             .body(Empty::<Bytes>::new())
             .unwrap();
         let client = hyper_util::pooling_client();
-        let body = client.request(req).await?.into_body();
-        let body = body.collect().await?.to_bytes();
-        let iter = std::str::from_utf8(&body)?
-            .lines()
-            .map(|x| Ok::<_, io::Error>(x.to_string()));
-        let scrape = prometheus_parse::Scrape::parse(iter).unwrap();
-        Ok(ParsedMetrics { scrape })
+        let (parts, body) = client.request(req).await?.into_parts();
+        let frame_stream = BodyStream::new(body);
+        let byte_stream = frame_stream.map(|item| {
+            item.map(|frame| frame.into_data().unwrap_or_else(|_| Bytes::new()))
+                .map_err(std::io::Error::other)
+        });
+
+        let body_reader = StreamReader::new(byte_stream);
+
+        let content_encoding = parts
+            .headers
+            .get(CONTENT_ENCODING)
+            .and_then(|val| val.to_str().ok())
+            .unwrap_or("");
+        if content_encoding != encoding {
+            return Err(anyhow!(
+                r#"Encoding mismatch: got "{}" want "{}""#,
+                content_encoding,
+                encoding
+            ));
+        }
+
+        // 3. Chain the reader into the appropriate wrapper stream
+        let mut decompressed_text = String::new();
+        match encoding {
+            "gzip" | "x-gzip" => {
+                let mut decoder = GzipDecoder::new(body_reader);
+                decoder.read_to_string(&mut decompressed_text).await?;
+            }
+            "br" => {
+                let mut decoder = BrotliDecoder::new(body_reader);
+                decoder.read_to_string(&mut decompressed_text).await?;
+            }
+            "zstd" => {
+                let mut decoder = ZstdDecoder::new(body_reader);
+                decoder.read_to_string(&mut decompressed_text).await?;
+            }
+            _ => {
+                // No compression or unsupported type; read raw bytes directly
+                let mut decoder = body_reader;
+                decoder.read_to_string(&mut decompressed_text).await?;
+            }
+        }
+
+        Ok(decompressed_text)
     }
 
     #[cfg(target_os = "linux")]
@@ -231,7 +291,7 @@ impl TestApp {
         hostname: &str,
         udp: bool,
         ipv6: bool,
-    ) -> hickory_proto::xfer::DnsResponse {
+    ) -> hickory_proto::op::DnsResponse {
         let addr = if udp {
             self.udp_dns_proxy_address.unwrap()
         } else {
@@ -246,7 +306,7 @@ pub async fn dns_request(
     hostname: &str,
     udp: bool,
     ipv6: bool,
-) -> hickory_proto::xfer::DnsResponse {
+) -> hickory_proto::op::DnsResponse {
     use crate::test_helpers::dns::n;
     use crate::test_helpers::dns::send_request;
     use crate::test_helpers::dns::{new_tcp_client, new_udp_client};

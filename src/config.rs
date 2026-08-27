@@ -54,10 +54,23 @@ const LOCAL_XDS_PATH: &str = "LOCAL_XDS_PATH";
 const LOCAL_XDS: &str = "LOCAL_XDS";
 const XDS_ON_DEMAND: &str = "XDS_ON_DEMAND";
 const XDS_ADDRESS: &str = "XDS_ADDRESS";
+const PREFERED_SERVICE_NAMESPACE: &str = "PREFERED_SERVICE_NAMESPACE";
 const CA_ADDRESS: &str = "CA_ADDRESS";
 const SECRET_TTL: &str = "SECRET_TTL";
 const FAKE_CA: &str = "FAKE_CA";
 const ZTUNNEL_WORKER_THREADS: &str = "ZTUNNEL_WORKER_THREADS";
+const ZTUNNEL_CPU_LIMIT: &str = "ZTUNNEL_CPU_LIMIT";
+// Set by the chart ONLY when resources.limits.cpu is configured; its presence signals an
+// explicit operator CPU limit, which we use directly as the worker-thread count (see
+// default_worker_threads). Separate from ZTUNNEL_CPU_LIMIT (see get_cpu_count), which the
+// downward API also fills with node-allocatable cores when no limit is set, so it cannot
+// distinguish "limited to all N cores" from "no limit on an N-core node".
+const ZTUNNEL_RESOURCE_CPU_LIMIT: &str = "ZTUNNEL_RESOURCE_CPU_LIMIT";
+// Set by the chart ONLY when resources.requests.cpu is configured; its presence signals an
+// explicit operator CPU request. We use it to raise the worker-thread floor (see
+// default_worker_threads) so a pod that reserves N cores gets at least N worker threads,
+// rather than the historical flat default of DEFAULT_WORKER_THREADS.
+const ZTUNNEL_RESOURCE_CPU_REQUEST: &str = "ZTUNNEL_RESOURCE_CPU_REQUEST";
 const POOL_MAX_STREAMS_PER_CONNECTION: &str = "POOL_MAX_STREAMS_PER_CONNECTION";
 const POOL_UNUSED_RELEASE_TIMEOUT: &str = "POOL_UNUSED_RELEASE_TIMEOUT";
 // CONNECTION_TERMINATION_DEADLINE configures an explicit deadline
@@ -70,9 +83,17 @@ const ENABLE_ORIG_SRC: &str = "ENABLE_ORIG_SRC";
 const PROXY_CONFIG: &str = "PROXY_CONFIG";
 const IPV6_ENABLED: &str = "IPV6_ENABLED";
 
+const HTTP2_STREAM_WINDOW_SIZE: &str = "HTTP2_STREAM_WINDOW_SIZE";
+const HTTP2_CONNECTION_WINDOW_SIZE: &str = "HTTP2_CONNECTION_WINDOW_SIZE";
+const HTTP2_FRAME_SIZE: &str = "HTTP2_FRAME_SIZE";
+
 const UNSTABLE_ENABLE_SOCKS5: &str = "UNSTABLE_ENABLE_SOCKS5";
 
+const CRL_PATH: &str = "CRL_PATH";
+
 const DEFAULT_WORKER_THREADS: u16 = 2;
+// Fraction of the node's logical cores used for worker threads when no explicit CPU limit is set.
+const DEFAULT_WORKER_THREAD_CPU_FRACTION: f64 = 0.25;
 const DEFAULT_ADMIN_PORT: u16 = 15000;
 const DEFAULT_READINESS_PORT: u16 = 15021;
 const DEFAULT_STATS_PORT: u16 = 15020;
@@ -107,6 +128,13 @@ const PROXY_MODE_DEDICATED: &str = "dedicated";
 const PROXY_MODE_SHARED: &str = "shared";
 
 const LOCALHOST_APP_TUNNEL: &str = "LOCALHOST_APP_TUNNEL";
+const ENABLE_ENHANCED_BAGGAGE: &str = "ENABLE_RESPONSE_BAGGAGE";
+
+/// When true, authorization policy logs are emitted at INFO level instead of DEBUG.
+pub static AUTHZ_POLICY_INFO_LOGGING: once_cell::sync::Lazy<bool> =
+    once_cell::sync::Lazy::new(|| {
+        env::var("AUTHZ_POLICY_INFO_LOGGING").unwrap_or_default() == "true"
+    });
 
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub enum RootCert {
@@ -237,6 +265,12 @@ pub struct Config {
     // Allow custom alternative XDS hostname verification
     pub alt_xds_hostname: Option<String>,
 
+    /// Prefered service namespace to use for service resolution.
+    /// If unset, local namespaces is preferred and other namespaces have equal priority.
+    /// If set, the local namespace is preferred, then the defined prefered_service_namespace
+    /// and finally other namespaces at an equal priority.
+    pub prefered_service_namespace: Option<String>,
+
     /// TTL for CSR requests
     pub secret_ttl: Duration,
     /// YAML config for local XDS workloads
@@ -293,6 +327,16 @@ pub struct Config {
 
     // If true, when AppTunnel is set for
     pub localhost_app_tunnel: bool,
+
+    pub ztunnel_identity: Option<identity::Identity>,
+
+    pub ztunnel_workload: Option<state::WorkloadInfo>,
+
+    pub ipv6_enabled: bool,
+
+    // path to CRL file; if set, enables CRL checking
+    pub crl_path: Option<PathBuf>,
+    pub enable_enhanced_baggage: bool,
 }
 
 #[derive(serde::Serialize, Clone, Copy, Debug)]
@@ -399,6 +443,106 @@ fn parse_headers(prefix: &str) -> Result<MetadataVector, Error> {
     Ok(metadata)
 }
 
+fn get_cpu_count() -> Result<usize, Error> {
+    // Allow overriding the count with an env var. This can be used to pass the CPU limit on Kubernetes
+    // from the downward API.
+    // Note the downward API will return the total thread count ("logical cores") if no limit is set,
+    // so it is really the same as num_cpus.
+    // We allow num_cpus for cases its not set (not on Kubernetes, etc).
+    // An explicit resource limit is the most precise answer, when present.
+    match parse_cpu_quantity(ZTUNNEL_RESOURCE_CPU_LIMIT)? {
+        Some(limit) => Ok(limit),
+        None => match parse::<usize>(ZTUNNEL_CPU_LIMIT)? {
+            Some(limit) => Ok(limit),
+            // This is *logical cores*
+            None => Ok(num_cpus::get()),
+        },
+    }
+}
+
+/// Parse an env var holding a Kubernetes CPU quantity (e.g. "2", "1.5", "500m") into a
+/// whole number of CPUs, rounding up.
+fn parse_cpu_quantity(env: &str) -> Result<Option<usize>, Error> {
+    let Some(raw) = parse::<String>(env)? else {
+        return Ok(None);
+    };
+    let cores = match raw.strip_suffix('m') {
+        Some(millis) => millis.parse::<f64>().map(|m| m / 1000.0),
+        None => raw.parse::<f64>(),
+    }
+    .map_err(|e| Error::EnvVar(env.to_string(), raw.clone(), e.to_string()))?;
+    if !cores.is_finite() || cores <= 0.0 {
+        return Err(Error::EnvVar(
+            env.to_string(),
+            raw,
+            "must be a positive CPU quantity".to_string(),
+        ));
+    }
+    Ok(Some(cores.ceil() as usize))
+}
+
+/// Default worker-thread count when neither ZTUNNEL_WORKER_THREADS nor proxy
+/// `concurrency` is set.
+fn default_worker_threads() -> Result<usize, Error> {
+    let request = parse_cpu_quantity(ZTUNNEL_RESOURCE_CPU_REQUEST)?.unwrap_or(0);
+    match parse_cpu_quantity(ZTUNNEL_RESOURCE_CPU_LIMIT)? {
+        // An explicit limit wins, even below DEFAULT_WORKER_THREADS; the request raises it.
+        Some(limit) => Ok(limit.max(request)),
+        // Otherwise a fraction of the available cores, floored at the request and the default.
+        None => {
+            let fraction =
+                (get_cpu_count()? as f64 * DEFAULT_WORKER_THREAD_CPU_FRACTION).ceil() as usize;
+            Ok(fraction.max(request).max(DEFAULT_WORKER_THREADS as usize))
+        }
+    }
+}
+
+/// Parse worker threads configuration, supporting both fixed numbers and percentages
+fn parse_worker_threads(default: usize) -> Result<usize, Error> {
+    match parse::<String>(ZTUNNEL_WORKER_THREADS)? {
+        Some(value) => {
+            if let Some(percent_str) = value.strip_suffix('%') {
+                // Parse as percentage
+                let percent: f64 = percent_str.parse().map_err(|e| {
+                    Error::EnvVar(
+                        ZTUNNEL_WORKER_THREADS.to_string(),
+                        value.clone(),
+                        format!("invalid percentage: {e}"),
+                    )
+                })?;
+
+                if percent <= 0.0 || percent > 100.0 {
+                    return Err(Error::EnvVar(
+                        ZTUNNEL_WORKER_THREADS.to_string(),
+                        value,
+                        "percentage must be between 0 and 100".to_string(),
+                    ));
+                }
+
+                let cpu_count = get_cpu_count()?;
+                // Round up, minimum of 1
+                let threads = ((cpu_count as f64 * percent / 100.0).ceil() as usize).max(1);
+                Ok(threads)
+            } else {
+                // Parse as fixed number
+                let threads = value.parse::<usize>().map_err(|e| {
+                    Error::EnvVar(
+                        ZTUNNEL_WORKER_THREADS.to_string(),
+                        value,
+                        format!("invalid number: {e}"),
+                    )
+                })?;
+                if threads == 0 {
+                    // 0 means "use all available cores", matching proxy `concurrency`.
+                    return get_cpu_count();
+                }
+                Ok(threads)
+            }
+        }
+        None => Ok(default),
+    }
+}
+
 pub fn parse_config() -> Result<Config, Error> {
     let pc = parse_proxy_config()?;
     construct_config(pc)
@@ -437,6 +581,14 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             .or(pc.discovery_address)
             .or_else(|| Some(default_istiod_address.clone())),
     ))?;
+
+    let prefered_service_namespace = match parse::<String>(PREFERED_SERVICE_NAMESPACE) {
+        Ok(ns) => ns,
+        Err(e) => {
+            warn!(err=?e, "failed to parse {PREFERED_SERVICE_NAMESPACE}, continuing with default behavior");
+            None
+        }
+    };
 
     let istio_meta_cluster_id = ISTIO_META_PREFIX.to_owned() + CLUSTER_ID;
     let cluster_id: String = match parse::<String>(&istio_meta_cluster_id)? {
@@ -518,8 +670,11 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     // Note: since DNS proxy runs in the pod network namespace, we will recompute IPv6 enablement
     // on a pod-by-pod basis.
     let dns_proxy_addr: Address = match pc.proxy_metadata.get(DNS_PROXY_ADDR_METADATA) {
-        Some(dns_addr) => Address::new(ipv6_localhost_enabled, dns_addr)
-            .unwrap_or_else(|_| panic!("failed to parse DNS_PROXY_ADDR: {}", dns_addr)),
+        Some(dns_addr) => Address::new(ipv6_localhost_enabled, dns_addr).map_err(|e| {
+            Error::InvalidState(format!(
+                "failed to parse {DNS_PROXY_ADDR_METADATA}: {dns_addr} ({e})"
+            ))
+        })?,
         None => Address::Localhost(ipv6_localhost_enabled, DEFAULT_DNS_PORT),
     };
 
@@ -600,6 +755,29 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 
     let socket_config_defaults = SocketConfig::default();
 
+    // Read ztunnel identity and workload info from Downward API if available
+    let (ztunnel_identity, ztunnel_workload) = match (
+        parse::<String>("POD_NAMESPACE")?,
+        parse::<String>("SERVICE_ACCOUNT")?,
+        parse::<String>("POD_NAME")?,
+    ) {
+        (Some(namespace), Some(service_account), Some(pod_name)) => {
+            let trust_domain = std::env::var("TRUST_DOMAIN")
+                .unwrap_or_else(|_| crate::identity::manager::DEFAULT_TRUST_DOMAIN.to_string());
+
+            let identity = identity::Identity::from_parts(
+                trust_domain.into(),
+                namespace.clone().into(),
+                service_account.clone().into(),
+            );
+
+            let workload = state::WorkloadInfo::new(pod_name, namespace, service_account);
+
+            (Some(identity), Some(workload))
+        }
+        _ => (None, None),
+    };
+
     validate_config(Config {
         proxy: parse_default(ENABLE_PROXY, true)?,
         // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
@@ -619,9 +797,15 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             DEFAULT_POOL_UNUSED_RELEASE_TIMEOUT,
         )?,
 
-        window_size: 4 * 1024 * 1024,
-        connection_window_size: 4 * 1024 * 1024,
-        frame_size: 1024 * 1024,
+        // window size: per-stream limit
+        window_size: parse_default(HTTP2_STREAM_WINDOW_SIZE, 4 * 1024 * 1024)?,
+        // connection window size: per connection.
+        // Setting this to the same value as window_size can introduce deadlocks in some applications
+        // where clients do not read data on streamA until they receive data on streamB.
+        // If streamA consumes the entire connection window, we enter a deadlock.
+        // A 4x limit should be appropriate without introducing too much potential buffering.
+        connection_window_size: parse_default(HTTP2_CONNECTION_WINDOW_SIZE, 16 * 1024 * 1024)?,
+        frame_size: parse_default(HTTP2_FRAME_SIZE, 1024 * 1024)?,
 
         self_termination_deadline: match parse_duration(CONNECTION_TERMINATION_DEADLINE)? {
             Some(period) => period,
@@ -675,6 +859,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 
         xds_address,
         xds_root_cert,
+        prefered_service_namespace,
         ca_address,
         ca_root_cert,
         alt_xds_hostname: parse(ALT_XDS_HOSTNAME)?,
@@ -688,10 +873,16 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         fake_ca,
         auth,
 
-        num_worker_threads: parse_default(
-            ZTUNNEL_WORKER_THREADS,
-            pc.concurrency.unwrap_or(DEFAULT_WORKER_THREADS).into(),
-        )?,
+        num_worker_threads: parse_worker_threads(match pc.concurrency {
+            // Explicit positive concurrency: use it directly.
+            Some(concurrency) if concurrency > 0 => concurrency as usize,
+            // concurrency == 0 means "use all available cores"
+            Some(_) => get_cpu_count()?,
+            // Unset: CPU-aware auto-default.
+            None => default_worker_threads()?,
+        })?
+        // The tokio runtime builder panics on 0 worker threads.
+        .max(1),
 
         require_original_source: parse(ENABLE_ORIG_SRC)?,
         proxy_args: parse_args(),
@@ -753,6 +944,15 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         ca_headers: parse_headers(ISTIO_CA_HEADER_PREFIX)?,
 
         localhost_app_tunnel: parse_default(LOCALHOST_APP_TUNNEL, true)?,
+        ztunnel_identity,
+        ztunnel_workload,
+        ipv6_enabled,
+
+        crl_path: env::var(CRL_PATH)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+        enable_enhanced_baggage: parse_default(ENABLE_ENHANCED_BAGGAGE, true)?,
     })
 }
 
@@ -870,10 +1070,10 @@ fn construct_proxy_config(mc_path: &str, pc_env: Option<&str>) -> anyhow::Result
 }
 
 pub fn empty_to_none<A: AsRef<str>>(inp: Option<A>) -> Option<A> {
-    if let Some(inner) = &inp {
-        if inner.as_ref().is_empty() {
-            return None;
-        }
+    if let Some(inner) = &inp
+        && inner.as_ref().is_empty()
+    {
+        return None;
     }
     inp
 }
@@ -960,11 +1160,14 @@ pub mod tests {
 
     #[test]
     fn config_from_proxyconfig() {
+        use crate::test_helpers::{MESH_CONFIG_YAML, temp_file_with_content};
+
         let default_config = construct_config(ProxyConfig::default())
             .expect("could not build Config without ProxyConfig");
 
         // mesh config only
-        let mesh_config_path = "./src/test_helpers/mesh_config.yaml";
+        let mesh_config_file = temp_file_with_content(MESH_CONFIG_YAML).unwrap();
+        let mesh_config_path = mesh_config_file.path().to_str().unwrap();
         let pc = construct_proxy_config(mesh_config_path, None).unwrap();
         let cfg = construct_config(pc).unwrap();
         assert_eq!(cfg.stats_addr.port(), 15888);
@@ -1054,5 +1257,144 @@ pub mod tests {
             let value: AsciiMetadataValue = AsciiMetadataValue::from_str(&v).unwrap();
             assert!(metadata.vec.contains(&(key, value)));
         }
+    }
+
+    #[test]
+    fn test_parse_worker_threads() {
+        unsafe {
+            // Test fixed number
+            env::set_var(ZTUNNEL_WORKER_THREADS, "4");
+            assert_eq!(parse_worker_threads(2).unwrap(), 4);
+
+            // Test percentage with CPU limit
+            env::set_var(ZTUNNEL_CPU_LIMIT, "8");
+            env::set_var(ZTUNNEL_WORKER_THREADS, "50%");
+            assert_eq!(parse_worker_threads(2).unwrap(), 4); // 50% of 8 CPUs = 4 threads
+
+            // Test percentage with CPU limit
+            env::set_var(ZTUNNEL_CPU_LIMIT, "16");
+            env::set_var(ZTUNNEL_WORKER_THREADS, "30%");
+            assert_eq!(parse_worker_threads(2).unwrap(), 5); // Round up to 5
+
+            // Test low percentage that rounds up to 1
+            env::set_var(ZTUNNEL_CPU_LIMIT, "4");
+            env::set_var(ZTUNNEL_WORKER_THREADS, "10%");
+            assert_eq!(parse_worker_threads(2).unwrap(), 1); // 10% of 4 CPUs = 0.4, rounds up to 1
+
+            // Test default when no env var is set
+            env::remove_var(ZTUNNEL_WORKER_THREADS);
+            assert_eq!(parse_worker_threads(2).unwrap(), 2);
+
+            // Test without CPU limit (should use system CPU count)
+            env::remove_var(ZTUNNEL_CPU_LIMIT);
+            let system_cpus = num_cpus::get();
+            assert_eq!(get_cpu_count().unwrap(), system_cpus);
+
+            // Test with CPU limit
+            env::set_var(ZTUNNEL_CPU_LIMIT, "12");
+            assert_eq!(get_cpu_count().unwrap(), 12);
+
+            // An explicit resource limit takes precedence over ZTUNNEL_CPU_LIMIT.
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "3");
+            assert_eq!(get_cpu_count().unwrap(), 3);
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_LIMIT);
+
+            // Clean up
+            env::remove_var(ZTUNNEL_WORKER_THREADS);
+            env::remove_var(ZTUNNEL_CPU_LIMIT);
+
+            // default_worker_threads: explicit limit wins, even above the node fraction.
+            env::remove_var(ZTUNNEL_CPU_LIMIT);
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "16");
+            assert_eq!(default_worker_threads().unwrap(), 16);
+
+            // An explicit limit below the default is honored, not raised.
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "1");
+            assert_eq!(default_worker_threads().unwrap(), 1);
+
+            // Milli-CPU and fractional quantities round up.
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "500m");
+            assert_eq!(default_worker_threads().unwrap(), 1);
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "2500m");
+            assert_eq!(default_worker_threads().unwrap(), 3);
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "1.5");
+            assert_eq!(default_worker_threads().unwrap(), 2);
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_LIMIT);
+
+            // The fraction fallback consults ZTUNNEL_CPU_LIMIT via get_cpu_count.
+            env::set_var(ZTUNNEL_CPU_LIMIT, "32");
+            assert_eq!(default_worker_threads().unwrap(), 8); // 25% of 32
+            env::remove_var(ZTUNNEL_CPU_LIMIT);
+
+            // default_worker_threads: node fraction wins when no explicit limit is present.
+            let node_default =
+                (num_cpus::get() as f64 * DEFAULT_WORKER_THREAD_CPU_FRACTION).ceil() as usize;
+            assert_eq!(
+                default_worker_threads().unwrap(),
+                node_default.max(DEFAULT_WORKER_THREADS as usize)
+            );
+
+            // default_worker_threads: a CPU request raises the floor above the default.
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_LIMIT);
+            env::set_var(ZTUNNEL_RESOURCE_CPU_REQUEST, "8");
+            assert_eq!(
+                default_worker_threads().unwrap(),
+                node_default.max(8),
+                "request should raise the floor to at least 8"
+            );
+
+            // default_worker_threads: a request below the default doesn't lower the floor.
+            env::set_var(ZTUNNEL_RESOURCE_CPU_REQUEST, "1");
+            assert_eq!(default_worker_threads().unwrap(), node_default.max(2));
+
+            // default_worker_threads: the limit still wins as the count, with the request
+            // acting only as the lower bound.
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "16");
+            env::set_var(ZTUNNEL_RESOURCE_CPU_REQUEST, "4");
+            assert_eq!(default_worker_threads().unwrap(), 16);
+
+            // ...and when the request exceeds the limit, the request floor wins.
+            env::set_var(ZTUNNEL_RESOURCE_CPU_LIMIT, "4");
+            env::set_var(ZTUNNEL_RESOURCE_CPU_REQUEST, "8");
+            assert_eq!(default_worker_threads().unwrap(), 8);
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_LIMIT);
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_REQUEST);
+
+            // ZTUNNEL_WORKER_THREADS=0 means all available cores, like `concurrency`.
+            env::set_var(ZTUNNEL_WORKER_THREADS, "0");
+            env::set_var(ZTUNNEL_CPU_LIMIT, "6");
+            assert_eq!(parse_worker_threads(2).unwrap(), 6);
+
+            // concurrency == 0 means all available cores.
+            env::remove_var(ZTUNNEL_WORKER_THREADS);
+            let pc = ProxyConfig {
+                concurrency: Some(0),
+                ..ProxyConfig::default()
+            };
+            let cfg = construct_config(pc).unwrap();
+            assert_eq!(cfg.num_worker_threads, 6);
+
+            // Clean up
+            env::remove_var(ZTUNNEL_WORKER_THREADS);
+            env::remove_var(ZTUNNEL_CPU_LIMIT);
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_LIMIT);
+            env::remove_var(ZTUNNEL_RESOURCE_CPU_REQUEST);
+        }
+    }
+
+    #[test]
+    fn invalid_dns_proxy_addr_returns_error() {
+        let pc = ProxyConfig {
+            proxy_metadata: HashMap::from([(
+                DNS_PROXY_ADDR_METADATA.to_string(),
+                "not-an-address".to_string(),
+            )]),
+            ..ProxyConfig::default()
+        };
+
+        let err = construct_config(pc).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidState(msg) if msg.contains("failed to parse DNS_PROXY_ADDR: not-an-address"))
+        );
     }
 }

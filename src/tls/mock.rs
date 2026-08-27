@@ -18,12 +18,11 @@ use std::fmt::{Display, Formatter};
 use rand::RngCore;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use rcgen::{Certificate, CertificateParams, KeyPair};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::tls::TLS_VERSIONS;
+use crate::tls::tls_versions;
 use rustls::ServerConfig;
 
 use super::{ServerCertProvider, TlsError, WorkloadCertificate};
@@ -33,6 +32,8 @@ pub const TEST_WORKLOAD_CERT: &[u8] = include_bytes!("cert.pem");
 pub const TEST_PKEY: &[u8] = include_bytes!("key.pem");
 pub const TEST_ROOT: &[u8] = include_bytes!("root-cert.pem");
 pub const TEST_ROOT_KEY: &[u8] = include_bytes!("ca-key.pem");
+pub const TEST_ROOT2: &[u8] = include_bytes!("root-cert2.pem");
+pub const TEST_ROOT2_KEY: &[u8] = include_bytes!("ca-key2.pem");
 
 /// TestIdentity is an identity used for testing. This extends the Identity with test-only types
 #[derive(Debug)]
@@ -103,6 +104,22 @@ pub fn generate_test_certs_at(
     not_after: SystemTime,
     rng: Option<&mut dyn rand::RngCore>,
 ) -> WorkloadCertificate {
+    let (key, cert) = generate_test_certs_with_root(id, not_before, not_after, rng, TEST_ROOT_KEY);
+    let mut workload =
+        WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), vec![TEST_ROOT]).unwrap();
+    // Certificates do not allow sub-millisecond, but we need this for tests.
+    workload.cert.expiry.not_before = not_before;
+    workload.cert.expiry.not_after = not_after;
+    workload
+}
+
+pub fn generate_test_certs_with_root(
+    id: &TestIdentity,
+    not_before: SystemTime,
+    not_after: SystemTime,
+    rng: Option<&mut dyn rand::RngCore>,
+    ca_key: &[u8],
+) -> (String, String) {
     use rcgen::*;
     let serial_number = {
         let mut data = [0u8; 20];
@@ -114,7 +131,6 @@ pub fn generate_test_certs_at(
         data[0] &= 0x7f;
         data
     };
-    let ca_cert = test_ca();
     let mut p = CertificateParams::default();
     p.not_before = not_before.into();
     p.not_after = not_after.into();
@@ -131,21 +147,19 @@ pub fn generate_test_certs_at(
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
     p.subject_alt_names = vec![match id {
-        TestIdentity::Identity(i) => SanType::URI(Ia5String::try_from(i.to_string()).unwrap()),
+        TestIdentity::Identity(i) => {
+            SanType::URI(string::Ia5String::try_from(i.to_string()).unwrap())
+        }
         TestIdentity::Ip(i) => SanType::IpAddress(*i),
     }];
 
     let kp = KeyPair::from_pem(std::str::from_utf8(TEST_PKEY).unwrap()).unwrap();
-    let ca_kp = KeyPair::from_pem(std::str::from_utf8(TEST_ROOT_KEY).unwrap()).unwrap();
+    let ca_kp = KeyPair::from_pem(std::str::from_utf8(ca_key).unwrap()).unwrap();
     let key = kp.serialize_pem();
-    let cert = p.signed_by(&kp, &ca_cert, &ca_kp).unwrap();
+    let issuer = Issuer::from_params(&p, &ca_kp);
+    let cert = p.signed_by(&kp, &issuer).unwrap();
     let cert = cert.pem();
-    let mut workload =
-        WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), vec![TEST_ROOT]).unwrap();
-    // Certificates do not allow sub-millisecond, but we need this for tests.
-    workload.cert.expiry.not_before = not_before;
-    workload.cert.expiry.not_after = not_after;
-    workload
+    (key, cert)
 }
 
 pub fn generate_test_certs(
@@ -155,13 +169,6 @@ pub fn generate_test_certs(
 ) -> WorkloadCertificate {
     let not_before = SystemTime::now() + duration_until_valid;
     generate_test_certs_at(id, not_before, not_before + duration_until_expiry, None)
-}
-
-fn test_ca() -> Certificate {
-    let key = KeyPair::from_pem(std::str::from_utf8(TEST_ROOT_KEY).unwrap()).unwrap();
-    let ca_param =
-        CertificateParams::from_ca_cert_pem(std::str::from_utf8(TEST_ROOT).unwrap()).unwrap();
-    ca_param.self_signed(&key).unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -177,15 +184,86 @@ impl MockServerCertProvider {
 impl ServerCertProvider for MockServerCertProvider {
     async fn fetch_cert(&mut self) -> Result<Arc<ServerConfig>, TlsError> {
         let mut sc = ServerConfig::builder_with_provider(crate::tls::lib::provider())
-            .with_protocol_versions(TLS_VERSIONS)
+            .with_protocol_versions(tls_versions())
             .expect("server config must be valid")
             .with_no_client_auth()
             .with_single_cert(
-                self.0.cert_and_intermediates(),
+                self.0.cert_and_intermediates_der(),
                 self.0.private_key.clone_key(),
             )
             .unwrap();
         sc.alpn_protocols = vec![b"h2".into()];
         Ok(Arc::new(sc))
     }
+}
+
+/// Sign a PEM CRL with `ca_key` that revokes the given serial number.
+/// Requires the CA cert (whose key is `ca_key`) to have been issued with the `cRLSign` key usage.
+/// The CRL issuer DN is set to `O=cluster.local` to match what `generate_test_certs_with_root`
+/// embeds as the issuer field in issued leaf certs and what `TEST_ROOT` sets for its subject.
+#[cfg(any(test, feature = "testing"))]
+pub fn crl_pem_revoking_cert(revoked_serial: &[u8]) -> String {
+    use rcgen::*;
+
+    let ca_kp = KeyPair::from_pem(std::str::from_utf8(TEST_ROOT_KEY).unwrap()).unwrap();
+    let mut ca_params = rcgen::CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::OrganizationName, "cluster.local");
+    ca_params.distinguished_name = dn;
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let now = time::OffsetDateTime::now_utc();
+    let crl_params = CertificateRevocationListParams {
+        this_update: now,
+        next_update: now + time::Duration::days(30),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from_slice(revoked_serial),
+            revocation_time: now,
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    };
+    let issuer = Issuer::from_params(&ca_params, &ca_kp);
+    crl_params
+        .signed_by(&issuer)
+        .expect("sign CRL")
+        .pem()
+        .expect("CRL PEM")
+}
+
+/// Generate an intermediate CA certificate signed by `root_ca_key`, using the same `O=cluster.local` DN as `TEST_ROOT`.
+/// Returns the IA key (PEM), cert (PEM), and serial number (bytes).
+#[cfg(test)]
+pub fn generate_intermediate_ca(root_ca_key: &[u8]) -> (String, String, Vec<u8>) {
+    use rcgen::*;
+
+    let ia_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate IA key");
+    let root_kp = KeyPair::from_pem(std::str::from_utf8(root_ca_key).unwrap()).unwrap();
+
+    let ia_serial = SerialNumber::from(12345u64);
+
+    let mut ia_params = CertificateParams::default();
+    ia_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ia_params.serial_number = Some(ia_serial.clone());
+    ia_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::OrganizationName, "cluster.local");
+    ia_params.distinguished_name = dn;
+
+    let mut root_params = CertificateParams::default();
+    let mut root_dn = DistinguishedName::new();
+    root_dn.push(DnType::OrganizationName, "cluster.local");
+    root_params.distinguished_name = root_dn;
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root_issuer = Issuer::from_params(&root_params, &root_kp);
+
+    let ia_cert_pem = ia_params
+        .signed_by(&ia_kp, &root_issuer)
+        .expect("IA cert sign by root failed")
+        .pem();
+    let ia_key_pem = ia_kp.serialize_pem();
+    (ia_key_pem, ia_cert_pem, ia_serial.to_bytes())
 }

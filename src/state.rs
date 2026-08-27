@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::authpol_log;
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
 use crate::rbac::Authorization;
@@ -33,9 +34,9 @@ use crate::{cert_fetcher, config, rbac, xds};
 use crate::{proxy, strng};
 use educe::Educe;
 use futures_util::FutureExt;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use hickory_resolver::config::*;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use itertools::Itertools;
 use rand::prelude::IteratorRandom;
 use rand::seq::IndexedRandom;
@@ -62,7 +63,8 @@ pub struct Upstream {
     pub workload: Arc<Workload>,
     /// selected_workload_ip defines the IP address we should actually use to connect to this workload
     /// This handles multiple IPs (dual stack) or Hostname destinations (DNS resolution)
-    pub selected_workload_ip: IpAddr,
+    /// The workload IP might be empty if we have to go through a network gateway.
+    pub selected_workload_ip: Option<IpAddr>,
     /// Port is the port we should connect to
     pub port: u16,
     /// Service SANs defines SANs defined at the service level *only*. A complete view of things requires
@@ -72,9 +74,16 @@ pub struct Upstream {
     pub destination_service: Option<ServiceDescription>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpstreamDestination {
+    UpstreamParts(Arc<Workload>, u16, Option<Arc<Service>>),
+    OriginalDestination,
+}
+
 impl Upstream {
-    pub fn workload_socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.selected_workload_ip, self.port)
+    pub fn workload_socket_addr(&self) -> Option<SocketAddr> {
+        self.selected_workload_ip
+            .map(|ip| SocketAddr::new(ip, self.port))
     }
     pub fn workload_and_services_san(&self) -> Vec<Identity> {
         self.service_sans
@@ -87,6 +96,19 @@ impl Upstream {
                 }
             })
             .chain(std::iter::once(self.workload.identity()))
+            .collect()
+    }
+
+    pub fn service_sans(&self) -> Vec<Identity> {
+        self.service_sans
+            .iter()
+            .flat_map(|san| match Identity::from_str(san) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    warn!("ignoring invalid SAN {}: {}", san, err);
+                    None
+                }
+            })
             .collect()
     }
 }
@@ -219,20 +241,26 @@ impl ProxyState {
     }
 
     /// Find either a workload or service by the destination.
-    pub fn find_destination(&self, dest: &Destination) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub fn find_destination(&self, dest: &Destination, ns: Option<&Strng>) -> Option<Address> {
         match dest {
-            Destination::Address(addr) => self.find_address(addr),
+            Destination::Address(addr) => self.find_address(addr, ns),
             Destination::Hostname(hostname) => self.find_hostname(hostname),
         }
     }
 
     /// Find either a workload or a service by address.
-    pub fn find_address(&self, network_addr: &NetworkAddress) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub fn find_address(
+        &self,
+        network_addr: &NetworkAddress,
+        ns: Option<&Strng>,
+    ) -> Option<Address> {
         // 1. handle workload ip, if workload not found fallback to service.
         match self.workloads.find_address(network_addr) {
             None => {
                 // 2. handle service
-                if let Some(svc) = self.services.get_by_vip(network_addr) {
+                if let Some(svc) = self.services.get_best_by_vip(network_addr, ns) {
                     return Some(Address::Service(svc));
                 }
                 None
@@ -260,10 +288,14 @@ impl ProxyState {
     }
 
     /// Find services by hostname.
-    pub fn find_service_by_hostname(&self, hostname: &Strng) -> Result<Vec<Arc<Service>>, Error> {
+    pub fn find_service_by_hostname(
+        &self,
+        hostname: &Strng,
+        namespace: &Strng,
+    ) -> Result<Arc<Service>, Error> {
         // Hostnames for services are more common, so lookup service first and fallback to workload.
         self.services
-            .get_by_host(hostname)
+            .get_best_by_host(hostname, Some(namespace))
             .ok_or_else(|| Error::NoHostname(hostname.to_string()))
     }
 
@@ -273,11 +305,16 @@ impl ProxyState {
         source_workload: &Workload,
         addr: SocketAddr,
         resolution_mode: ServiceResolutionMode,
-    ) -> Option<(Arc<Workload>, u16, Option<Arc<Service>>)> {
-        if let Some(svc) = self
-            .services
-            .get_by_vip(&network_addr(network.clone(), addr.ip()))
-        {
+    ) -> Option<UpstreamDestination> {
+        if let Some(svc) = self.services.get_best_by_vip(
+            &network_addr(network.clone(), addr.ip()),
+            Some(&source_workload.namespace),
+        ) {
+            if let Some(lb) = &svc.load_balancer
+                && lb.mode == LoadBalancerMode::Passthrough
+            {
+                return Some(UpstreamDestination::OriginalDestination);
+            }
             return self.find_upstream_from_service(
                 source_workload,
                 addr.port(),
@@ -289,7 +326,7 @@ impl ProxyState {
             .workloads
             .find_address(&network_addr(network, addr.ip()))
         {
-            return Some((wl, addr.port(), None));
+            return Some(UpstreamDestination::UpstreamParts(wl, addr.port(), None));
         }
         None
     }
@@ -300,7 +337,7 @@ impl ProxyState {
         svc_port: u16,
         resolution_mode: ServiceResolutionMode,
         svc: Arc<Service>,
-    ) -> Option<(Arc<Workload>, u16, Option<Arc<Service>>)> {
+    ) -> Option<UpstreamDestination> {
         // Randomly pick an upstream
         // TODO: do this more efficiently, and not just randomly
         let Some((ep, wl)) = self.load_balance(source_workload, &svc, svc_port, resolution_mode)
@@ -328,7 +365,11 @@ impl ProxyState {
             return None;
         };
 
-        Some((wl, target_port, Some(svc)))
+        Some(UpstreamDestination::UpstreamParts(
+            wl,
+            target_port,
+            Some(svc),
+        ))
     }
 
     fn load_balance<'a>(
@@ -351,6 +392,19 @@ impl ProxyState {
                 debug!("failed to fetch workload for {}", ep.workload_uid);
                 return None;
             };
+
+            let in_network = wl.network == src.network;
+            let has_network_gateway = wl.network_gateway.is_some();
+            let has_address = !wl.workload_ips.is_empty() || !wl.hostname.is_empty();
+            if !has_address {
+                // Workload has no IP. We can only reach it via a network gateway
+                // WDS is client-agnostic, so we will get a network gateway for a workload
+                // even if it's in the same network; we should never use it.
+                if in_network || !has_network_gateway {
+                    return None;
+                }
+            }
+
             match resolution_mode {
                 ServiceResolutionMode::Standard => {
                     if target_port.unwrap_or_default() == 0 && !ep.port.contains_key(&svc_port) {
@@ -381,14 +435,20 @@ impl ProxyState {
 
         let options = match svc.load_balancer {
             Some(ref lb) if lb.mode != LoadBalancerMode::Standard => {
+                let network_preferred = !lb.routing_preferences.is_empty()
+                    && lb.routing_preferences[0] == LoadBalancerScopes::Network;
                 let ranks = endpoints
                     .filter_map(|(ep, wl)| {
                         // Load balancer will define N targets we want to match
                         // Consider [network, region, zone]
-                        // Rank = 3 means we match all of them
-                        // Rank = 2 means network and region match
+                        // Rank = 5 means we match all of them
+                        // Rank = 4 means network and region match
+                        // Rank = 3 means network match
+                        // Rank = 2 means region and zone match
+                        // Rank = 1 means region match
                         // Rank = 0 means none match
                         let mut rank = 0;
+                        let mut adjust = 0;
                         for target in &lb.routing_preferences {
                             let matches = match target {
                                 LoadBalancerScopes::Region => {
@@ -400,7 +460,18 @@ impl ProxyState {
                                 }
                                 LoadBalancerScopes::Node => src.node == wl.node,
                                 LoadBalancerScopes::Cluster => src.cluster_id == wl.cluster_id,
-                                LoadBalancerScopes::Network => src.network == wl.network,
+                                LoadBalancerScopes::Network => {
+                                    let m = src.network == wl.network;
+                                    if network_preferred {
+                                        if m {
+                                            adjust = lb.routing_preferences.len() - 1;
+                                        } else {
+                                            // try the other scopes
+                                            continue;
+                                        }
+                                    }
+                                    m
+                                }
                             };
                             if matches {
                                 rank += 1;
@@ -414,6 +485,8 @@ impl ProxyState {
                         {
                             return None;
                         }
+                        // adjust for the network match
+                        rank += adjust;
                         Some((rank, ep, wl))
                     })
                     .collect::<Vec<_>>();
@@ -451,7 +524,7 @@ pub struct DemandProxyState {
     metrics: Arc<proxy::Metrics>,
 
     #[serde(skip_serializing)]
-    dns_resolver: TokioAsyncResolver,
+    dns_resolver: TokioResolver,
 }
 
 impl DemandProxyState {
@@ -464,6 +537,24 @@ impl DemandProxyState {
     }
 }
 
+/// sample_weighted_waypoint picks one waypoint from a service's weighted set, proportional to
+/// each entry's weight (used to shift a share of connections between waypoints during a canary).
+/// Returns None when there is no usable weighted set — an empty set, or one that is not samplable
+/// (e.g. all weights zero) — in which case the caller falls back to the single `waypoint` field.
+fn sample_weighted_waypoint<'a>(
+    service: &'a Service,
+    rng: &mut impl rand::Rng,
+) -> Option<&'a GatewayAddress> {
+    if service.weighted_waypoints.is_empty() {
+        return None;
+    }
+    service
+        .weighted_waypoints
+        .choose_weighted(rng, |ww| ww.weight)
+        .ok()
+        .map(|ww| &ww.destination)
+}
+
 impl DemandProxyState {
     pub fn new(
         state: Arc<RwLock<ProxyState>>,
@@ -472,11 +563,12 @@ impl DemandProxyState {
         dns_resolver_opts: ResolverOpts,
         metrics: Arc<proxy::Metrics>,
     ) -> Self {
-        let dns_resolver = TokioAsyncResolver::new(
-            dns_resolver_cfg.to_owned(),
-            dns_resolver_opts.clone(),
-            TokioConnectionProvider::default(),
+        let mut rb = hickory_resolver::Resolver::builder_with_config(
+            dns_resolver_cfg,
+            TokioRuntimeProvider::default(),
         );
+        *rb.options_mut() = dns_resolver_opts;
+        let dns_resolver = rb.build().expect("dns resolver config should be valid");
         Self {
             state,
             demand,
@@ -503,7 +595,7 @@ impl DemandProxyState {
         let workload = wl.authorization_policies.iter();
 
         // Aggregate all of them based on type
-        let (allow, deny): (Vec<_>, Vec<_>) = ns
+        let (all_allow, all_deny): (Vec<_>, Vec<_>) = ns
             .iter()
             .chain(global.iter())
             .chain(workload)
@@ -518,6 +610,11 @@ impl DemandProxyState {
             })
             .partition(|p| p.action == rbac::RbacAction::Allow);
 
+        let (deny, deny_dry_run): (Vec<&Authorization>, Vec<&Authorization>) =
+            all_deny.iter().partition(|p| !p.dry_run);
+        let (allow, allow_dry_run): (Vec<&Authorization>, Vec<&Authorization>) =
+            all_allow.iter().partition(|p| !p.dry_run);
+
         trace!(
             allow = allow.len(),
             deny = deny.len(),
@@ -526,10 +623,15 @@ impl DemandProxyState {
 
         // Allow and deny logic follows https://istio.io/latest/docs/reference/config/security/authorization-policy/
 
+        for pol in deny_dry_run.iter() {
+            if pol.matches(conn) {
+                authpol_log!(policy = pol.to_key().as_str(), "dry-run: deny policy match");
+            }
+        }
         // "If there are any DENY policies that match the request, deny the request."
         for pol in deny.iter() {
             if pol.matches(conn) {
-                debug!(policy = pol.to_key().as_str(), "deny policy match");
+                authpol_log!(policy = pol.to_key().as_str(), "deny policy match");
                 return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
                     pol.namespace.to_owned(),
                     pol.name.to_owned(),
@@ -538,15 +640,30 @@ impl DemandProxyState {
                 trace!(policy = pol.to_key().as_str(), "deny policy does not match");
             }
         }
+        let mut dry_run_allow_matched = false;
+        for pol in allow_dry_run.iter() {
+            if pol.matches(conn) {
+                dry_run_allow_matched = true;
+                authpol_log!(
+                    policy = pol.to_key().as_str(),
+                    "dry-run: allow policy match"
+                );
+            }
+        }
+        if allow.is_empty() && !allow_dry_run.is_empty() && !dry_run_allow_matched {
+            // this is going to be an allow, but the conn would be denied if dry-run policies
+            // became enforced because none matched
+            authpol_log!("dry-run: no allow policies match");
+        }
         // "If there are no ALLOW policies for the workload, allow the request."
         if allow.is_empty() {
-            debug!("no allow policies, allow");
+            authpol_log!("no allow policies, allow");
             return Ok(());
         }
         // "If any of the ALLOW policies match the request, allow the request."
         for pol in allow.iter() {
             if pol.matches(conn) {
-                debug!(policy = pol.to_key().as_str(), "allow policy match");
+                authpol_log!(policy = pol.to_key().as_str(), "allow policy match");
                 return Ok(());
             } else {
                 trace!(
@@ -556,7 +673,7 @@ impl DemandProxyState {
             }
         }
         // "Deny the request."
-        debug!("no allow policies matched");
+        authpol_log!("no allow policies matched");
         Err(proxy::AuthorizationRejectionError::NotAllowed)
     }
 
@@ -567,13 +684,13 @@ impl DemandProxyState {
         src_workload: &Workload,
         original_target_address: SocketAddr,
         ip_family_restriction: Option<IpFamily>,
-    ) -> Result<IpAddr, Error> {
+    ) -> Result<Option<IpAddr>, Error> {
         // If the user requested the pod by a specific IP, use that directly.
         if dst_workload
             .workload_ips
             .contains(&original_target_address.ip())
         {
-            return Ok(original_target_address.ip());
+            return Ok(Some(original_target_address.ip()));
         }
         // They may have 1 or 2 IPs (single/dual stack)
         // Ensure we are meeting the Service family restriction (if any is defined).
@@ -588,14 +705,19 @@ impl DemandProxyState {
             })
             .find_or_first(|ip| ip.is_ipv6() == original_target_address.is_ipv6())
         {
-            return Ok(*ip);
+            return Ok(Some(*ip));
         }
         if dst_workload.hostname.is_empty() {
-            debug!(
-                "workload {} has no suitable workload IPs for routing",
-                dst_workload.name
-            );
-            return Err(Error::NoValidDestination(Box::new(dst_workload.clone())));
+            if dst_workload.network_gateway.is_none() {
+                debug!(
+                    "workload {} has no suitable workload IPs for routing",
+                    dst_workload.name
+                );
+                return Err(Error::NoValidDestination(Box::new(dst_workload.clone())));
+            } else {
+                // We can route through network gateway
+                return Ok(None);
+            }
         }
         let ip = Box::pin(self.resolve_workload_address(
             dst_workload,
@@ -603,7 +725,7 @@ impl DemandProxyState {
             original_target_address,
         ))
         .await?;
-        Ok(ip)
+        Ok(Some(ip))
     }
 
     async fn resolve_workload_address(
@@ -643,9 +765,7 @@ impl DemandProxyState {
         trace!(%hostname, "dns lookup complete {resp:?}");
 
         let (matching, unmatching): (Vec<_>, Vec<_>) = resp
-            .as_lookup()
-            .record_iter()
-            .filter_map(|record| record.data().and_then(|d| d.ip_addr()))
+            .iter()
             .partition(|record| record.is_ipv6() == original_target_address.is_ipv6());
         // Randomly pick an IP, prefer to match the IP family of the downstream request.
         // Without this, we run into trouble in pure v4 or pure v6 environments.
@@ -739,8 +859,11 @@ impl DemandProxyState {
         addr: SocketAddr,
         resolution_mode: ServiceResolutionMode,
     ) -> Result<Option<Upstream>, Error> {
-        self.fetch_address(&network_addr(network.clone(), addr.ip()))
-            .await;
+        self.fetch_address(
+            &network_addr(network.clone(), addr.ip()),
+            Some(&source_workload.namespace),
+        )
+        .await;
         let upstream = {
             self.read()
                 .find_upstream(network, source_workload, addr, resolution_mode)
@@ -755,10 +878,11 @@ impl DemandProxyState {
         &self,
         source_workload: &Workload,
         original_target_address: SocketAddr,
-        upstream: Option<(Arc<Workload>, u16, Option<Arc<Service>>)>,
+        upstream: Option<UpstreamDestination>,
     ) -> Result<Option<Upstream>, Error> {
-        let Some((wl, port, svc)) = upstream else {
-            return Ok(None);
+        let (wl, port, svc) = match upstream {
+            Some(UpstreamDestination::UpstreamParts(wl, port, svc)) => (wl, port, svc),
+            None | Some(UpstreamDestination::OriginalDestination) => return Ok(None),
         };
         let svc_desc = svc.clone().map(|s| ServiceDescription::from(s.as_ref()));
         let ip_family_restriction = svc.as_ref().and_then(|s| s.ip_families);
@@ -779,6 +903,69 @@ impl DemandProxyState {
         };
         tracing::trace!(?res, "finalize_upstream");
         Ok(Some(res))
+    }
+
+    /// Returns destination address, upstream sans, and final sans, for
+    /// connecting to a remote workload through a gateway.
+    /// Would be nice to return this as an Upstream, but gateways don't necessarily
+    /// have workloads. That is, they could just be IPs without a corresponding workload.
+    pub async fn fetch_network_gateway(
+        &self,
+        gw_address: &GatewayAddress,
+        source_workload: &Workload,
+        original_destination_address: SocketAddr,
+    ) -> Result<Upstream, Error> {
+        let (res, target_address) = match &gw_address.destination {
+            Destination::Address(ip) => {
+                let addr = SocketAddr::new(ip.address, gw_address.hbone_mtls_port);
+                let us = self.state.read().unwrap().find_upstream(
+                    ip.network.clone(),
+                    source_workload,
+                    addr,
+                    ServiceResolutionMode::Standard,
+                );
+                // If the workload references a network gateway by IP, use that IP as the destination.
+                // Note this means that an IPv6 call may be translated to IPv4 if the network
+                // gateway is specified as an IPv4 address.
+                // For this reason, the Hostname method is preferred which can adapt to the callers IP family.
+                (us, addr)
+            }
+            Destination::Hostname(host) => {
+                let state = self.read();
+                match state.find_hostname(host) {
+                    Some(Address::Service(s)) => {
+                        let us = state.find_upstream_from_service(
+                            source_workload,
+                            gw_address.hbone_mtls_port,
+                            ServiceResolutionMode::Standard,
+                            s,
+                        );
+                        // For hostname, use the original_destination_address as the target so we can
+                        // adapt to the callers IP family.
+                        (us, original_destination_address)
+                    }
+                    Some(Address::Workload(w)) => {
+                        let us = Some(UpstreamDestination::UpstreamParts(
+                            w,
+                            gw_address.hbone_mtls_port,
+                            None,
+                        ));
+                        (us, original_destination_address)
+                    }
+                    None => {
+                        return Err(Error::UnknownNetworkGateway(format!(
+                            "network gateway {} not found",
+                            host.hostname
+                        )));
+                    }
+                }
+            }
+        };
+        self.finalize_upstream(source_workload, target_address, res)
+            .await?
+            .ok_or_else(|| {
+                Error::UnknownNetworkGateway(format!("network gateway {gw_address:?} not found"))
+            })
     }
 
     async fn fetch_waypoint(
@@ -819,7 +1006,11 @@ impl DemandProxyState {
                         (us, original_destination_address)
                     }
                     Some(Address::Workload(w)) => {
-                        let us = Some((w, gw_address.hbone_mtls_port, None));
+                        let us = Some(UpstreamDestination::UpstreamParts(
+                            w,
+                            gw_address.hbone_mtls_port,
+                            None,
+                        ));
                         (us, original_destination_address)
                     }
                     None => {
@@ -833,7 +1024,7 @@ impl DemandProxyState {
         };
         self.finalize_upstream(source_workload, target_address, res)
             .await?
-            .ok_or_else(|| Error::UnknownWaypoint(format!("waypoint {:?} not found", gw_address)))
+            .ok_or_else(|| Error::UnknownWaypoint(format!("waypoint {gw_address:?} not found")))
     }
 
     pub async fn fetch_service_waypoint(
@@ -842,9 +1033,17 @@ impl DemandProxyState {
         source_workload: &Workload,
         original_destination_address: SocketAddr,
     ) -> Result<Option<Upstream>, Error> {
-        let Some(gw_address) = &service.waypoint else {
-            // no waypoint
-            return Ok(None);
+        // Choose a weighted waypoint, else fall back to the single
+        // `waypoint` field, preserving existing behavior.
+        let gw_address = match sample_weighted_waypoint(service, &mut rand::rng()) {
+            Some(gw_address) => gw_address,
+            None => {
+                let Some(gw_address) = &service.waypoint else {
+                    // no waypoint
+                    return Ok(None);
+                };
+                gw_address
+            }
         };
         self.fetch_waypoint(gw_address, source_workload, original_destination_address)
             .await
@@ -868,19 +1067,29 @@ impl DemandProxyState {
 
     /// Looks for either a workload or service by the destination. If not found locally,
     /// attempts to fetch on-demand.
-    pub async fn fetch_destination(&self, dest: &Destination) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub async fn fetch_destination(
+        &self,
+        dest: &Destination,
+        ns: Option<&Strng>,
+    ) -> Option<Address> {
         match dest {
-            Destination::Address(addr) => self.fetch_address(addr).await,
+            Destination::Address(addr) => self.fetch_address(addr, ns).await,
             Destination::Hostname(hostname) => self.fetch_hostname(hostname).await,
         }
     }
 
     /// Looks for the given address to find either a workload or service by IP. If not found
     /// locally, attempts to fetch on-demand.
-    pub async fn fetch_address(&self, network_addr: &NetworkAddress) -> Option<Address> {
+    /// If `ns` is provided, prefer a service in that namespace when multiple share the same VIP.
+    pub async fn fetch_address(
+        &self,
+        network_addr: &NetworkAddress,
+        ns: Option<&Strng>,
+    ) -> Option<Address> {
         // Wait for it on-demand, *if* needed
         debug!(%network_addr.address, "fetch address");
-        if let Some(address) = self.read().find_address(network_addr) {
+        if let Some(address) = self.read().find_address(network_addr, ns) {
             return Some(address);
         }
         if !self.supports_on_demand() {
@@ -888,7 +1097,7 @@ impl DemandProxyState {
         }
         // if both cache not found, start on demand fetch
         self.fetch_on_demand(network_addr.to_string().into()).await;
-        self.read().find_address(network_addr)
+        self.read().find_address(network_addr, ns)
     }
 
     /// Looks for the given hostname to find either a workload or service by IP. If not found
@@ -1009,6 +1218,8 @@ mod tests {
     use crate::state::workload::{HealthStatus, Locality};
     use prometheus_client::registry::Registry;
     use rbac::StringMatch;
+    use std::cmp::max;
+    use std::collections::HashSet;
     use std::{net::Ipv4Addr, net::SocketAddrV4, time::Duration};
 
     use self::workload::{ApplicationTunnel, application_tunnel::Protocol as AppProtocol};
@@ -1018,6 +1229,114 @@ mod tests {
 
     use crate::{strng, test_helpers};
     use test_case::test_case;
+
+    #[test]
+    fn test_sample_weighted_waypoint() {
+        use crate::state::service::WeightedWaypoint;
+        let ga = |ip: &str| GatewayAddress {
+            destination: Destination::Address(NetworkAddress {
+                network: "".into(),
+                address: ip.parse().unwrap(),
+            }),
+            hbone_mtls_port: 15008,
+        };
+        let svc = |waypoint: Option<GatewayAddress>, weighted: Vec<WeightedWaypoint>| Service {
+            waypoint,
+            weighted_waypoints: weighted,
+            ..test_helpers::mock_default_service()
+        };
+        let a = ga("10.0.0.1");
+        let b = ga("10.0.0.2");
+        // Seed deterministically so the distribution assertion below cannot flake.
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
+
+        // No weighted set -> None (caller falls back to the single `waypoint` field).
+        assert_eq!(sample_weighted_waypoint(&svc(None, vec![]), &mut rng), None);
+
+        // A zero-weight entry is never selected: [100, 0] always picks the first (primary).
+        let primary_only = svc(
+            None,
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 100,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 0,
+                },
+            ],
+        );
+        for _ in 0..50 {
+            assert_eq!(sample_weighted_waypoint(&primary_only, &mut rng), Some(&a));
+        }
+
+        // [0, 100] always picks the second (canary fully promoted).
+        let canary_only = svc(
+            None,
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 0,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 100,
+                },
+            ],
+        );
+        for _ in 0..50 {
+            assert_eq!(sample_weighted_waypoint(&canary_only, &mut rng), Some(&b));
+        }
+
+        // All-zero weights are not samplable -> None (fall back to primary).
+        let all_zero = svc(
+            Some(a.clone()),
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 0,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 0,
+                },
+            ],
+        );
+        assert_eq!(sample_weighted_waypoint(&all_zero, &mut rng), None);
+
+        // A genuine split tracks the configured weights across many samples.
+        // 75/25 is asymmetric so the assertion would catch a swapped or ignored weight.
+        let split = svc(
+            None,
+            vec![
+                WeightedWaypoint {
+                    destination: a.clone(),
+                    weight: 75,
+                },
+                WeightedWaypoint {
+                    destination: b.clone(),
+                    weight: 25,
+                },
+            ],
+        );
+        let n = 10_000;
+        let (mut count_a, mut count_b) = (0, 0);
+        for _ in 0..n {
+            match sample_weighted_waypoint(&split, &mut rng) {
+                Some(x) if *x == a => count_a += 1,
+                Some(x) if *x == b => count_b += 1,
+                other => panic!("unexpected selection: {other:?}"),
+            }
+        }
+        // Expect ~75/25. With a fixed seed and a wide tolerance this is stable, not statistical.
+        let frac_a = count_a as f64 / n as f64;
+        assert!(
+            (0.70..0.80).contains(&frac_a),
+            "expected ~75% for a, got {frac_a} (a={count_a}, b={count_b})"
+        );
+    }
 
     #[tokio::test]
     async fn test_wait_for_workload() {
@@ -1150,7 +1469,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             Some(Address::Workload(Arc::new(
                 test_helpers::test_default_workload(),
             ))),
@@ -1164,7 +1483,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             Some(Address::Service(Arc::new(
                 test_helpers::mock_default_service(),
             ))),
@@ -1178,7 +1497,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             None,
         )
         .await;
@@ -1190,7 +1509,7 @@ mod tests {
         });
         test_helpers::assert_eventually(
             Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            || mock_proxy_state.fetch_destination(&dst, None),
             None,
         )
         .await;
@@ -1276,26 +1595,28 @@ mod tests {
             _ => ServiceResolutionMode::Standard,
         };
 
-        let (_, port, _) = state
-            .find_upstream("".into(), &wl, "10.0.0.1:80".parse().unwrap(), mode)
-            .expect("upstream to be found");
+        let port = match state.find_upstream("".into(), &wl, "10.0.0.1:80".parse().unwrap(), mode) {
+            Some(UpstreamDestination::UpstreamParts(_, port, _)) => port,
+            _ => panic!("upstream to be found"),
+        };
+
         assert_eq!(port, tc.expected_port());
     }
 
     fn create_workload(dest_uid: u8) -> Workload {
         Workload {
             name: "test".into(),
-            namespace: format!("ns{}", dest_uid).into(),
+            namespace: format!("ns{dest_uid}").into(),
             trust_domain: "cluster.local".into(),
             service_account: "defaultacct".into(),
             workload_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, dest_uid))],
-            uid: format!("{}", dest_uid).into(),
+            uid: format!("{dest_uid}").into(),
             ..test_helpers::test_default_workload()
         }
     }
 
     fn get_workload(state: &DemandProxyState, dest_uid: u8) -> Arc<Workload> {
-        let key: Strng = format!("{}", dest_uid).into();
+        let key: Strng = format!("{dest_uid}").into();
         state.read().workloads.by_uid[&key].clone()
     }
 
@@ -1304,7 +1625,7 @@ mod tests {
         dest_uid: u8,
         src_svc_acct: &str,
     ) -> crate::state::ProxyRbacContext {
-        let key: Strng = format!("{}", dest_uid).into();
+        let key: Strng = format!("{dest_uid}").into();
         let workload = &state.read().workloads.by_uid[&key];
         crate::state::ProxyRbacContext {
             conn: rbac::Connection {
@@ -1335,6 +1656,17 @@ mod tests {
         )
     }
 
+    fn create_dry_run_wildcard_rbac_policy(action: rbac::RbacAction) -> rbac::Authorization {
+        rbac::Authorization {
+            action,
+            namespace: "ns1".into(),
+            name: "wildcard".into(),
+            rules: vec![vec![]],
+            scope: rbac::RbacScope::Namespace,
+            dry_run: true,
+        }
+    }
+
     // test that we confirm with https://istio.io/latest/docs/reference/config/security/authorization-policy/.
     // We don't test #1 as ztunnel doesn't support custom policies.
     // 1. If there are any CUSTOM policies that match the request, evaluate and deny the request if the evaluation result is deny.
@@ -1347,6 +1679,15 @@ mod tests {
         let mut state = ProxyState::new(None);
         state.workloads.insert(Arc::new(create_workload(1)));
         state.workloads.insert(Arc::new(create_workload(2)));
+        // Dry run policies should have no effect.
+        state.policies.insert(
+            "wildcard-allow".into(),
+            create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow),
+        );
+        state.policies.insert(
+            "wildcard-deny".into(),
+            create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Deny),
+        );
         state.policies.insert(
             "allow".into(),
             rbac::Authorization {
@@ -1366,6 +1707,7 @@ mod tests {
                     ],
                 ],
                 scope: rbac::RbacScope::Namespace,
+                dry_run: false,
             },
         );
         state.policies.insert(
@@ -1387,6 +1729,7 @@ mod tests {
                     ],
                 ],
                 scope: rbac::RbacScope::Namespace,
+                dry_run: false,
             },
         );
 
@@ -1449,6 +1792,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assert_rbac_dry_run_with_real_policies() {
+        initialize_telemetry();
+        crate::telemetry::set_level(true, "debug").ok();
+
+        let mut state = ProxyState::new(None);
+        state.workloads.insert(Arc::new(create_workload(1)));
+
+        // Real deny policy that matches denyacct
+        state.policies.insert(
+            "real-deny".into(),
+            rbac::Authorization {
+                action: rbac::RbacAction::Deny,
+                namespace: "ns1".into(),
+                name: "real-deny".into(),
+                rules: vec![vec![vec![rbac::RbacMatch {
+                    principals: vec![StringMatch::Exact(
+                        "cluster.local/ns/default/sa/denyacct".into(),
+                    )],
+                    ..Default::default()
+                }]]],
+                scope: rbac::RbacScope::Namespace,
+                dry_run: false,
+            },
+        );
+
+        // Dry-run deny policy that matches both defaultacct and denyacct
+        state.policies.insert(
+            "dry-run-deny".into(),
+            rbac::Authorization {
+                action: rbac::RbacAction::Deny,
+                namespace: "ns1".into(),
+                name: "dry-run-deny".into(),
+                rules: vec![
+                    vec![vec![rbac::RbacMatch {
+                        principals: vec![StringMatch::Exact(
+                            "cluster.local/ns/default/sa/defaultacct".into(),
+                        )],
+                        ..Default::default()
+                    }]],
+                    vec![vec![rbac::RbacMatch {
+                        principals: vec![StringMatch::Exact(
+                            "cluster.local/ns/default/sa/denyacct".into(),
+                        )],
+                        ..Default::default()
+                    }]],
+                ],
+                scope: rbac::RbacScope::Namespace,
+                dry_run: true,
+            },
+        );
+
+        // Real allow policy that matches defaultacct
+        state.policies.insert(
+            "real-allow".into(),
+            rbac::Authorization {
+                action: rbac::RbacAction::Allow,
+                namespace: "ns1".into(),
+                name: "real-allow".into(),
+                rules: vec![vec![vec![rbac::RbacMatch {
+                    principals: vec![StringMatch::Exact(
+                        "cluster.local/ns/default/sa/defaultacct".into(),
+                    )],
+                    ..Default::default()
+                }]]],
+                scope: rbac::RbacScope::Namespace,
+                dry_run: false,
+            },
+        );
+
+        // Dry-run allow policy that matches defaultacct
+        state.policies.insert(
+            "dry-run-allow".into(),
+            rbac::Authorization {
+                action: rbac::RbacAction::Allow,
+                namespace: "ns1".into(),
+                name: "dry-run-allow".into(),
+                rules: vec![vec![vec![rbac::RbacMatch {
+                    principals: vec![StringMatch::Exact(
+                        "cluster.local/ns/default/sa/defaultacct".into(),
+                    )],
+                    ..Default::default()
+                }]]],
+                scope: rbac::RbacScope::Namespace,
+                dry_run: true,
+            },
+        );
+
+        let mock_proxy_state = create_state(state);
+
+        let ctx = get_rbac_context(&mock_proxy_state, 1, "defaultacct");
+        assert!(mock_proxy_state.assert_rbac(&ctx).await.is_ok());
+
+        crate::telemetry::testing::assert_contains(std::collections::HashMap::from([
+            ("policy", "ns1/dry-run-deny"),
+            ("message", "dry-run: deny policy match"),
+        ]));
+        crate::telemetry::testing::assert_contains(std::collections::HashMap::from([
+            ("policy", "ns1/dry-run-allow"),
+            ("message", "dry-run: allow policy match"),
+        ]));
+    }
+
+    #[tokio::test]
     async fn test_load_balance() {
         initialize_telemetry();
         let mut state = ProxyState::new(None);
@@ -1459,6 +1905,7 @@ mod tests {
             trust_domain: "cluster.local".into(),
             service_account: "default".into(),
             workload_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))],
+            network: "network".into(),
             ..test_helpers::test_default_workload()
         };
         let wl_match = Workload {
@@ -1491,36 +1938,37 @@ mod tests {
             },
             ..test_helpers::test_default_workload()
         };
-        let _ep_almost = Workload {
-            uid: "cluster1//v1/Pod/default/ep_almost".into(),
-            name: "wl_almost".into(),
-            namespace: "default".into(),
-            trust_domain: "cluster.local".into(),
-            service_account: "default".into(),
-            workload_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 4))],
-            network: "network".into(),
-            locality: Locality {
-                region: "reg".into(),
-                zone: "other-not-zone".into(),
-                subzone: "".into(),
-            },
-            ..test_helpers::test_default_workload()
-        };
-        let _ep_no_match = Workload {
-            uid: "cluster1//v1/Pod/default/ep_no_match".into(),
-            name: "wl_almost".into(),
+        let wl_other = Workload {
+            uid: "cluster1//v1/Pod/default/wl_other".into(),
+            name: "wl_other".into(),
             namespace: "default".into(),
             trust_domain: "cluster.local".into(),
             service_account: "default".into(),
             workload_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 5))],
-            network: "not-network".into(),
+            network: "other".into(),
             locality: Locality {
-                region: "not-reg".into(),
-                zone: "unmatched-zone".into(),
+                region: "reg".into(),
+                zone: "zone".into(),
                 subzone: "".into(),
             },
             ..test_helpers::test_default_workload()
         };
+        let wl_empty_ip = Workload {
+            uid: "cluster1//v1/Pod/default/wl_empty_ip".into(),
+            name: "wl_empty_ip".into(),
+            namespace: "default".into(),
+            trust_domain: "cluster.local".into(),
+            service_account: "default".into(),
+            workload_ips: vec![], // none!
+            network: "network".into(),
+            locality: Locality {
+                region: "reg".into(),
+                zone: "zone".into(),
+                subzone: "".into(),
+            },
+            ..test_helpers::test_default_workload()
+        };
+
         let endpoints = EndpointSet::from_list([
             Endpoint {
                 workload_uid: "cluster1//v1/Pod/default/ep_almost".into(),
@@ -1528,12 +1976,27 @@ mod tests {
                 status: HealthStatus::Healthy,
             },
             Endpoint {
-                workload_uid: "cluster1//v1/Pod/default/ep_no_match".into(),
+                workload_uid: "cluster1//v1/Pod/default/wl_match".into(),
                 port: HashMap::from([(80u16, 80u16)]),
                 status: HealthStatus::Healthy,
             },
             Endpoint {
-                workload_uid: "cluster1//v1/Pod/default/wl_match".into(),
+                workload_uid: "cluster1//v1/Pod/default/wl_almost".into(),
+                port: HashMap::from([(80u16, 80u16)]),
+                status: HealthStatus::Healthy,
+            },
+            Endpoint {
+                workload_uid: "cluster1//v1/Pod/default/wl_no_locality".into(),
+                port: HashMap::from([(80u16, 80u16)]),
+                status: HealthStatus::Healthy,
+            },
+            Endpoint {
+                workload_uid: "cluster1//v1/Pod/default/wl_other".into(),
+                port: HashMap::from([(80u16, 80u16)]),
+                status: HealthStatus::Healthy,
+            },
+            Endpoint {
+                workload_uid: "cluster1//v1/Pod/default/wl_empty_ip".into(),
                 port: HashMap::from([(80u16, 80u16)]),
                 status: HealthStatus::Healthy,
             },
@@ -1566,32 +2029,44 @@ mod tests {
             ports: HashMap::from([(80u16, 80u16)]),
             ..test_helpers::mock_default_service()
         };
-        state.workloads.insert(Arc::new(wl_no_locality.clone()));
         state.workloads.insert(Arc::new(wl_match.clone()));
         state.workloads.insert(Arc::new(wl_almost.clone()));
+        state.workloads.insert(Arc::new(wl_no_locality.clone()));
+        state.workloads.insert(Arc::new(wl_other.clone()));
+        state.workloads.insert(Arc::new(wl_empty_ip.clone()));
         state.services.insert(strict_svc.clone());
         state.services.insert(failover_svc.clone());
 
         let assert_endpoint = |src: &Workload, svc: &Service, workloads: Vec<&str>, desc: &str| {
-            let got = state
-                .load_balance(src, svc, 80, ServiceResolutionMode::Standard)
-                .map(|(ep, _)| ep.workload_uid.to_string());
-            if workloads.is_empty() {
-                assert!(got.is_none(), "{}", desc);
-            } else {
-                let want: Vec<String> = workloads.iter().map(ToString::to_string).collect();
-                assert!(want.contains(&got.unwrap()), "{}", desc);
+            let want: Vec<String> = workloads.iter().map(ToString::to_string).collect();
+            let tries = max(1, workloads.len() * 10);
+            let mut gots = HashSet::new();
+            for _ in 0..tries {
+                let got = state
+                    .load_balance(src, svc, 80, ServiceResolutionMode::Standard)
+                    .map(|(ep, _)| ep.workload_uid.to_string());
+                if workloads.is_empty() {
+                    assert!(got.is_none(), "{} {:?}", desc, got);
+                } else {
+                    gots.insert(got.unwrap());
+                }
             }
+            assert_eq!(HashSet::from_iter(want), gots, "{}", desc);
         };
+        let assert_not_endpoint =
+            |src: &Workload, svc: &Service, uid: &str, tries: usize, desc: &str| {
+                for _ in 0..tries {
+                    let got = state
+                        .load_balance(src, svc, 80, ServiceResolutionMode::Standard)
+                        .map(|(ep, _)| ep.workload_uid.as_str());
+                    assert!(got != Some(uid), "{}", desc);
+                }
+            };
 
         assert_endpoint(
-            &wl_no_locality,
-            &strict_svc,
-            vec![],
-            "strict no match should not select",
-        );
-        assert_endpoint(
-            &wl_almost,
+            &Workload {
+                ..test_helpers::test_default_workload()
+            },
             &strict_svc,
             vec![],
             "strict no match should not select",
@@ -1604,29 +2079,98 @@ mod tests {
         );
 
         assert_endpoint(
-            &wl_no_locality,
+            &Workload {
+                network: "no-match".into(),
+                locality: Locality {
+                    region: "no-match".into(),
+                    zone: "no-match".into(),
+                    subzone: "".into(),
+                },
+                ..test_helpers::test_default_workload()
+            },
             &failover_svc,
             vec![
-                "cluster1//v1/Pod/default/ep_almost",
-                "cluster1//v1/Pod/default/ep_no_match",
                 "cluster1//v1/Pod/default/wl_match",
+                "cluster1//v1/Pod/default/wl_almost",
+                "cluster1//v1/Pod/default/wl_no_locality",
+                "cluster1//v1/Pod/default/wl_other",
             ],
             "failover no match can select any endpoint",
         );
         assert_endpoint(
-            &wl_almost,
-            &failover_svc,
-            vec![
-                "cluster1//v1/Pod/default/ep_almost",
-                "cluster1//v1/Pod/default/wl_match",
-            ],
-            "failover almost match can select any close matches",
-        );
-        assert_endpoint(
-            &wl_match,
+            &Workload {
+                network: "network".into(),
+                locality: Locality {
+                    region: "reg".into(),
+                    zone: "zone".into(),
+                    subzone: "".into(),
+                },
+                ..test_helpers::test_default_workload()
+            },
             &failover_svc,
             vec!["cluster1//v1/Pod/default/wl_match"],
-            "failover full match selects closest match",
+            "failover matches network+region+zone",
+        );
+        assert_endpoint(
+            &Workload {
+                network: "network".into(),
+                locality: Locality {
+                    region: "reg".into(),
+                    zone: "".into(),
+                    subzone: "".into(),
+                },
+                ..test_helpers::test_default_workload()
+            },
+            &failover_svc,
+            vec![
+                "cluster1//v1/Pod/default/wl_match",
+                "cluster1//v1/Pod/default/wl_almost",
+            ],
+            "failover matches network+region",
+        );
+        assert_endpoint(
+            &Workload {
+                network: "network".into(),
+                locality: Locality {
+                    region: "no-match".into(),
+                    zone: "no-match".into(),
+                    subzone: "".into(),
+                },
+                ..test_helpers::test_default_workload()
+            },
+            &failover_svc,
+            vec![
+                "cluster1//v1/Pod/default/wl_match",
+                "cluster1//v1/Pod/default/wl_almost",
+                "cluster1//v1/Pod/default/wl_no_locality",
+            ],
+            "failover matches network",
+        );
+        assert_endpoint(
+            &Workload {
+                network: "no-match".into(),
+                locality: Locality {
+                    region: "reg".into(),
+                    zone: "zone".into(),
+                    subzone: "".into(),
+                },
+                ..test_helpers::test_default_workload()
+            },
+            &failover_svc,
+            vec![
+                "cluster1//v1/Pod/default/wl_match",
+                "cluster1//v1/Pod/default/wl_other",
+            ],
+            "failover matches region+zone",
+        );
+        assert_not_endpoint(
+            &Workload {
+                ..test_helpers::test_default_workload()
+            },
+            &failover_svc,
+            "cluster1//v1/Pod/default/wl_empty_ip",
+            10,
+            "failover never selects missing ip",
         );
     }
 }

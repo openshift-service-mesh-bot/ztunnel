@@ -16,11 +16,10 @@ use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 
 use crate::dns::resolver::Resolver;
-use hickory_proto::op::{Message, MessageType, Query};
+use hickory_net::xfer::Protocol;
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
-use hickory_proto::serialize::binary::BinDecodable;
-use hickory_server::authority::MessageRequest;
-use hickory_server::server::{Protocol, Request};
+use hickory_server::server::Request;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,6 +74,8 @@ impl Socks5 {
             self.pi.cfg.clone(),
             self.pi.socket_factory.clone(),
             self.pi.local_workload_information.clone(),
+            self.pi.crl_manager.clone(),
+            self.pi.metrics.clone(),
         );
         let accept = async move |drain: DrainWatcher, force_shutdown: watch::Receiver<()>| {
             loop {
@@ -85,6 +86,11 @@ impl Socks5 {
                 let mut force_shutdown = force_shutdown.clone();
                 match socket {
                     Ok((stream, _remote)) => {
+                        let socket_labels = crate::proxy::metrics::SocketLabels {
+                            reporter: crate::proxy::metrics::Reporter::source,
+                        };
+                        self.pi.metrics.record_socket_open(&socket_labels);
+
                         let oc = OutboundConnection {
                             pi: self.pi.clone(),
                             id: TraceParent::new(),
@@ -92,7 +98,12 @@ impl Socks5 {
                             hbone_port: self.pi.cfg.inbound_addr.port(),
                         };
                         let span = info_span!("socks5", id=%oc.id);
+                        let metrics_for_socket_close = self.pi.metrics.clone();
                         let serve = (async move {
+                            let _socket_guard = crate::proxy::metrics::SocketCloseGuard::new(
+                                metrics_for_socket_close,
+                                crate::proxy::metrics::Reporter::source,
+                            );
                             debug!(component="socks5", "connection started");
                             // Since this task is spawned, make sure we are guaranteed to terminate
                             tokio::select! {
@@ -106,7 +117,7 @@ impl Socks5 {
                             debug!(component="socks5", dur=?start.elapsed(), "connection completed");
                         }).instrument(span);
 
-                        assertions::size_between_ref(1000, 2000, &serve);
+                        assertions::size_between_ref(1000, 2150, &serve);
                         tokio::spawn(serve);
                     }
                     Err(e) => {
@@ -139,8 +150,17 @@ async fn handle_socks_connection(mut oc: OutboundConnection, mut stream: TcpStre
                 warn!("failed to send socks success response: {err}");
                 return;
             }
-            let remote_addr =
-                socket::to_canonical(stream.peer_addr().expect("must receive peer addr"));
+            let peer = match stream.peer_addr() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    debug!(
+                        component = "socks5",
+                        "failed to get peer address, dropping connection: {}", e
+                    );
+                    return;
+                }
+            };
+            let remote_addr = socket::to_canonical(peer);
             oc.proxy_to(stream, remote_addr, target).await
         }
         Err(e) => {
@@ -159,7 +179,7 @@ async fn negotiate_socks_connection(
     pi: &ProxyInputs,
     stream: &mut TcpStream,
 ) -> Result<SocketAddr, SocksError> {
-    let remote_addr = socket::to_canonical(stream.peer_addr().expect("must receive peer addr"));
+    let remote_addr = socket::to_canonical(stream.peer_addr()?);
 
     // Version(5), Number of auth methods
     let mut version = [0u8; 2];
@@ -175,10 +195,9 @@ async fn negotiate_socks_connection(
     let nmethods = version[1];
 
     if nmethods == 0 {
-        return Err(SocksError::invalid_protocol(format!(
-            "methods cannot be zero {}",
-            version[0]
-        )));
+        return Err(SocksError::invalid_protocol(
+            "methods cannot be zero".to_string(),
+        ));
     }
 
     // List of supported auth methods
@@ -202,8 +221,7 @@ async fn negotiate_socks_connection(
 
     if version != 0x05 {
         return Err(SocksError::invalid_protocol(format!(
-            "unsupported version {}",
-            version
+            "unsupported version {version}",
         )));
     }
 
@@ -278,10 +296,8 @@ async fn dns_lookup(
     hostname: &str,
 ) -> Result<IpAddr, Error> {
     fn new_message(name: Name, rr_type: RecordType) -> Message {
-        let mut msg = Message::new();
-        msg.set_id(rand::random());
-        msg.set_message_type(MessageType::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         msg.add_query(Query::query(name, rr_type));
         msg
     }
@@ -289,8 +305,7 @@ async fn dns_lookup(
     /// the client IP and protocol.
     fn server_request(msg: &Message, client_addr: SocketAddr, protocol: Protocol) -> Request {
         let wire_bytes = msg.to_vec().unwrap();
-        let msg_request = MessageRequest::from_bytes(&wire_bytes).unwrap();
-        Request::new(msg_request, client_addr, protocol)
+        Request::from_bytes(wire_bytes, client_addr, protocol).unwrap()
     }
 
     /// Creates a A-record [Request] for the given name.
@@ -312,14 +327,14 @@ async fn dns_lookup(
     } else {
         aaaa_request(name, client_addr, Protocol::Udp)
     };
-    let answer = resolver.lookup(&req).await?;
-    let response = answer
-        .record_iter()
-        .filter_map(|rec| rec.data().and_then(|d| d.ip_addr()))
+    let response = resolver.lookup(&req).await?;
+    let addrs = response
+        .answers()
+        .filter_map(|rec| rec.data.ip_addr())
         .next() // TODO: do not always use the first result
         .ok_or_else(|| Error::DnsEmpty)?;
 
-    Ok(response)
+    Ok(addrs)
 }
 
 /// send_error sends an error back to the SOCKS client

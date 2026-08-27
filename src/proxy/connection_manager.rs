@@ -24,10 +24,35 @@ use std::net::SocketAddr;
 
 use crate::drain;
 use crate::drain::{DrainTrigger, DrainWatcher};
-use crate::state::workload::Protocol;
+use crate::state::workload::{InboundProtocol, OutboundProtocol};
 use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+
+/// Future for a per-connection CRL revocation signal, used by [`handle_connection!`] as a
+/// `select!` arm alongside the RBAC drain. Resolves only when `rx`'s value flips to `true` (an
+/// actual revocation). `None` (e.g. plaintext passthrough, which has no client cert), a dropped
+/// sender, or a value that never becomes `true` all pend forever, so the connection's
+/// normal-completion arm wins instead of mis-attributing teardown as a revocation.
+///
+/// A `watch` is deliberately used here rather than the `drain` paradigm: a dropped `drain` signal
+/// resolves its watchers (`wait_for_drain` yields `Immediate`), which would mis-attribute every
+/// normal connection teardown as a revocation. A `watch` value distinguishes an explicit signal
+/// from a drop.
+pub async fn await_revocation(rx: Option<watch::Receiver<bool>>) {
+    match rx {
+        None => std::future::pending().await,
+        Some(mut rx) => loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        },
+    }
+}
 
 struct ConnectionDrain {
     // TODO: this should almost certainly be changed to a type which has counted references exposed.
@@ -87,14 +112,29 @@ pub struct ConnectionGuard {
 // Inlining it removes this entirely, and the macro ensures we do it consistently across the various areas we use it.
 #[macro_export]
 macro_rules! handle_connection {
-    ($connguard:expr, $future:expr) => {{
+    // `$crl_revoked` is an `Option<tokio::sync::watch::Receiver<bool>>`: the per-connection CRL
+    // revocation signal (`None` when no client cert / no CRL, e.g. plaintext passthrough). The two
+    // termination arms mirror each other — the RBAC drain yields `AuthorizationPolicyLateRejection`
+    // and a CRL revocation yields `CertificateRevoked` — so the existing `record(res)` attributes
+    // either via `extract_failure_reason` with no call-site conditionals.
+    ($connguard:expr, $crl_revoked:expr, $future:expr) => {{
         let watch = $connguard.watcher();
+        // `biased` with the termination arms first makes attribution deterministic.
+        // Both signals are set *before* the connection is torn down,
+        // so polling them ahead of `$future` guarantees a revocation/late-rejection
+        // wins the race rather than the generic teardown error.
         tokio::select! {
+            biased;
+            _ = $crate::proxy::connection_manager::await_revocation($crl_revoked) => {
+                // crl revocation signal originates in `RevocationIndex`, not `ConnectionManager` so release explicitly
+                $connguard.release();
+                Err(Error::CertificateRevoked)
+            }
+            _signaled = watch.wait_for_drain() => Err(Error::AuthorizationPolicyLateRejection),
             res = $future => {
                 $connguard.release();
                 res
             }
-            _signaled = watch.wait_for_drain() => Err(Error::AuthorizationPolicyLateRejection)
         }
     }};
 }
@@ -134,7 +174,7 @@ pub struct OutboundConnection {
     pub src: SocketAddr,
     pub original_dst: SocketAddr,
     pub actual_dst: SocketAddr,
-    pub protocol: Protocol,
+    pub protocol: OutboundProtocol,
 }
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
@@ -143,7 +183,7 @@ pub struct InboundConnectionDump {
     pub src: SocketAddr,
     pub original_dst: Option<String>,
     pub actual_dst: SocketAddr,
-    pub protocol: Protocol,
+    pub protocol: InboundProtocol,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize)]
@@ -160,7 +200,7 @@ impl ConnectionManager {
         src: SocketAddr,
         original_dst: SocketAddr,
         actual_dst: SocketAddr,
-        protocol: Protocol,
+        protocol: OutboundProtocol,
     ) -> OutboundConnectionGuard {
         let c = OutboundConnection {
             src,
@@ -231,12 +271,12 @@ impl ConnectionManager {
     // uses a counter to determine if there are other tracked connections or not so it may retain the tx/rx channels when necessary
     pub fn release(&self, c: &InboundConnection) {
         let mut drains = self.drains.write().expect("mutex");
-        if let Some((k, mut v)) = drains.remove_entry(c) {
-            if v.count > 1 {
-                // something else is tracking this connection, decrement count but retain
-                v.count -= 1;
-                drains.insert(k, v);
-            }
+        if let Some((k, mut v)) = drains.remove_entry(c)
+            && v.count > 1
+        {
+            // something else is tracking this connection, decrement count but retain
+            v.count -= 1;
+            drains.insert(k, v);
         }
     }
 
@@ -284,9 +324,9 @@ impl Serialize for ConnectionManager {
                 original_dst: c.dest_service,
                 actual_dst: c.ctx.conn.dst,
                 protocol: if c.ctx.conn.src_identity.is_some() {
-                    Protocol::HBONE
+                    InboundProtocol::HBONE
                 } else {
-                    Protocol::TCP
+                    InboundProtocol::TCP
                 },
             })
             .collect();
@@ -631,6 +671,8 @@ mod tests {
             scope: Scope::Global as i32,
             namespace: auth_namespace.into(),
             rules: vec![],
+            dry_run: false,
+            extensions: vec![],
         };
         let mut auth_xds_name = String::with_capacity(1 + auth_namespace.len() + auth_name.len());
         auth_xds_name.push_str(auth_namespace);

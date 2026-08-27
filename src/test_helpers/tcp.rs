@@ -31,7 +31,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
+use crate::baggage::{Baggage, baggage_header_val};
 use crate::hyper_util::TokioExecutor;
+use crate::proxy::BAGGAGE_HEADER;
+use crate::strng::Strng;
 use crate::{identity, tls};
 
 #[derive(Copy, Clone, Debug)]
@@ -222,16 +225,19 @@ pub struct HboneTestServer {
     listener: TcpListener,
     mode: Mode,
     name: String,
+    /// Write this message when acting as waypoint to show that waypoint was hit.
+    waypoint_message: Vec<u8>,
 }
 
 impl HboneTestServer {
-    pub async fn new(mode: Mode, name: &str) -> Self {
+    pub async fn new(mode: Mode, name: &str, waypoint_message: Vec<u8>) -> Self {
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 15008);
         let listener = TcpListener::bind(addr).await.unwrap();
         Self {
             listener,
             mode,
             name: name.to_string(),
+            waypoint_message,
         }
     }
 
@@ -244,7 +250,7 @@ impl HboneTestServer {
             &identity::Identity::Spiffe {
                 trust_domain: "cluster.local".into(),
                 namespace: "default".into(),
-                service_account: self.name.into(),
+                service_account: self.name.clone().into(),
             }
             .into(),
             Duration::from_secs(0),
@@ -253,25 +259,48 @@ impl HboneTestServer {
         let acceptor = tls::mock::MockServerCertProvider::new(certs);
         let mut tls_stream = crate::hyper_util::tls_server(acceptor, self.listener);
         let mode = self.mode;
+        let name = self.name.clone();
         while let Some(socket) = tls_stream.next().await {
+            let waypoint_message = self.waypoint_message.clone();
+            let name = name.clone();
             if let Err(err) = http2::Builder::new(TokioExecutor)
                 .serve_connection(
                     TokioIo::new(socket),
-                    service_fn(move |req| async move {
-                        info!("waypoint: received request");
-                        tokio::task::spawn(async move {
-                            match hyper::upgrade::on(req).await {
-                                Ok(upgraded) => {
-                                    let mut io = TokioIo::new(upgraded);
-                                    // let (mut ri, mut wi) = tokio::io::split(TokioIo::new(upgraded));
-                                    // Signal we are the waypoint so tests can validate this
-                                    io.write_all(b"waypoint\n").await.unwrap();
-                                    handle_stream(mode, &mut io).await;
+                    service_fn(move |req| {
+                        let waypoint_message = waypoint_message.clone();
+                        let name = name.clone();
+                        async move {
+                            info!("waypoint: received request");
+                            tokio::task::spawn(async move {
+                                match hyper::upgrade::on(req).await {
+                                    Ok(upgraded) => {
+                                        let mut io = TokioIo::new(upgraded);
+                                        // let (mut ri, mut wi) = tokio::io::split(TokioIo::new(upgraded));
+                                        // Signal we are the waypoint so tests can validate this
+                                        io.write_all(&waypoint_message[..]).await.unwrap();
+                                        handle_stream(mode, &mut io).await;
+                                    }
+                                    Err(e) => error!("No upgrade {e}"),
                                 }
-                                Err(e) => error!("No upgrade {e}"),
-                            }
-                        });
-                        Ok::<_, Infallible>(Response::new(Full::<Bytes>::from("streaming...")))
+                            });
+                            let mut resp = Response::new(Full::<Bytes>::from("streaming..."));
+                            let baggage = Baggage {
+                                cluster_id: Some(Strng::from("Kubernetes")),
+                                namespace: Some(Strng::from("default")),
+                                workload_name: Some(Strng::from(&name)),
+                                service_name: Some(Strng::from(&name)),
+                                revision: Some(Strng::from("v1")),
+                                region: Some(Strng::from("r1")),
+                                zone: Some(Strng::from("z1")),
+                            };
+                            resp.headers_mut().insert(
+                                BAGGAGE_HEADER,
+                                baggage_header_val(&baggage, "deployment")
+                                    .parse()
+                                    .expect("valid baggage header"),
+                            );
+                            Ok::<_, Infallible>(resp)
+                        }
                     }),
                 )
                 .await

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,6 +26,7 @@ use tracing::error;
 use crate::config::RootCert;
 
 use crate::identity::{AuthSource, CaClient};
+use crate::test_helpers::FAKE_JWT;
 use crate::test_helpers::hyper_tower;
 use crate::xds::istio::ca::istio_certificate_service_server::{
     IstioCertificateService, IstioCertificateServiceServer,
@@ -58,7 +58,7 @@ impl CaServer {
             Duration::from_secs(0),
             Duration::from_secs(100),
         );
-        let root_cert = RootCert::Static(certs.chain.iter().map(|c| c.as_pem()).join("\n").into());
+        let root_cert = RootCert::Static(certs.roots.iter().map(|c| c.as_pem()).join("\n").into());
         let acceptor = tls::mock::MockServerCertProvider::new(certs);
         let mut tls_stream = crate::hyper_util::tls_server(acceptor, listener);
         let srv = IstioCertificateServiceServer::new(server);
@@ -76,14 +76,12 @@ impl CaServer {
                 }
             }
         });
+
         let client = CaClient::new(
             "https://".to_string() + &server_addr.to_string(),
             None,
-            Box::new(tls::ControlPlaneAuthentication::RootCert(root_cert)),
-            AuthSource::Token(
-                PathBuf::from(r"src/test_helpers/fake-jwt"),
-                "Kubernetes".to_string(),
-            ),
+            root_cert,
+            AuthSource::StaticToken(FAKE_JWT.to_string(), "Kubernetes".to_string()),
             true,
             60 * 60 * 24,
             Vec::new(),

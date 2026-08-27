@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use ::hyper_util::service::TowerToHyperService;
 use bytes::Bytes;
 use std::sync::Mutex;
 use std::{net::SocketAddr, sync::Arc};
+use tower::ServiceBuilder;
+use tower_http::compression::CompressionLayer;
 
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -51,11 +54,19 @@ impl Server {
     }
 
     pub fn spawn(self) {
-        self.s.spawn(|registry, req| async move {
-            match req.uri().path() {
-                "/metrics" | "/stats/prometheus" => Ok(handle_metrics(registry, req).await),
-                _ => Ok(hyper_util::empty_response(hyper::StatusCode::NOT_FOUND)),
-            }
+        self.s.spawn_service(|registry: Arc<Mutex<Registry>>| {
+            let service = ServiceBuilder::new()
+                .layer(CompressionLayer::new())
+                .service_fn(move |req: Request<Incoming>| {
+                    let registry = registry.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(match req.uri().path() {
+                            "/metrics" | "/stats/prometheus" => handle_metrics(registry, req).await,
+                            _ => hyper_util::empty_response(hyper::StatusCode::NOT_FOUND),
+                        })
+                    }
+                });
+            TowerToHyperService::new(service)
         })
     }
 }
@@ -103,18 +114,12 @@ fn content_type<T>(req: &Request<T>) -> &str {
     req.headers()
         .get_all(http::header::ACCEPT)
         .iter()
-        .find_map(|v| {
-            match v
-                .to_str()
-                .unwrap_or_default()
-                .to_lowercase()
-                .split(";")
-                .collect::<Vec<_>>()
-                .first()
-            {
-                Some(&"application/openmetrics-text") => Some(ContentType::OpenMetrics),
-                _ => None,
-            }
+        .flat_map(|entry| entry.to_str().ok())
+        // get_all can return multiple in one line still
+        .flat_map(|entry| entry.split(",").map(|entry| entry.to_lowercase()))
+        .find_map(|v| match v.split(";").collect::<Vec<_>>().first() {
+            Some(&"application/openmetrics-text") => Some(ContentType::OpenMetrics),
+            _ => None,
         })
         .unwrap_or_default()
         .into()
@@ -138,6 +143,16 @@ mod test {
             .unwrap();
         assert_eq!(
             super::content_type(&openmetrics_req),
+            "application/openmetrics-text;charset=utf-8;version=1.0.0"
+        );
+
+        let mixed_req = http::Request::builder()
+          .header("X-Custom-Beep", "boop")
+          .header("Accept", "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.6,application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1")
+          .body("I would like openmetrics")
+          .unwrap();
+        assert_eq!(
+            super::content_type(&mixed_req),
             "application/openmetrics-text;charset=utf-8;version=1.0.0"
         );
 

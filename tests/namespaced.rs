@@ -18,12 +18,16 @@ mod namespaced {
     use futures::future::poll_fn;
     use http_body_util::Empty;
     use std::collections::HashMap;
+    use ztunnel::state::workload::ApplicationTunnel;
+    use ztunnel::state::workload::application_tunnel::Protocol;
+    use ztunnel::state::workload::gatewayaddress::Destination;
+    use ztunnel::state::workload::{GatewayAddress, NamespacedHostname};
+    use ztunnel::test_helpers::linux::TestMode;
 
     use std::net::{IpAddr, SocketAddr};
 
     use anyhow::Context;
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::Duration;
     use ztunnel::rbac::{Authorization, RbacMatch, StringMatch};
@@ -37,21 +41,22 @@ mod namespaced {
     use tokio::time::timeout;
     use tracing::{error, info};
 
-    use ztunnel::state::workload::{ApplicationTunnel, NetworkAddress};
-    use ztunnel::test_helpers::app::ParsedMetrics;
-    use ztunnel::test_helpers::app::TestApp;
-
-    use ztunnel::{identity, strng, telemetry};
-
-    use crate::namespaced::WorkloadMode::Captured;
-    use ztunnel::setup_netns_test;
+    use ztunnel::state::workload::NetworkAddress;
+    use ztunnel::test_helpers::app::{ParsedMetrics, TestApp};
     use ztunnel::test_helpers::linux::TestMode::{Dedicated, Shared};
     use ztunnel::test_helpers::linux::WorkloadManager;
     use ztunnel::test_helpers::netns::{Namespace, Resolver};
     use ztunnel::test_helpers::*;
 
+    use ztunnel::{config, identity, strng, telemetry};
+
+    use crate::namespaced::WorkloadMode::Captured;
+    use ztunnel::setup_netns_test;
+
+    const WAYPOINT_MESSAGE: &[u8] = b"waypoint\n";
+
     /// initialize_namespace_tests sets up the namespace tests.
-    #[ctor::ctor]
+    #[ctor::ctor(unsafe)]
     fn initialize_namespace_tests() {
         ztunnel::test_helpers::namespaced::initialize_namespace_tests();
     }
@@ -137,7 +142,12 @@ mod namespaced {
 
         let waypoint = manager.register_waypoint("waypoint", DEFAULT_NODE).await?;
         let waypoint_ip = waypoint.ip();
-        run_hbone_server(waypoint, "waypoint")?;
+        run_hbone_server(
+            waypoint,
+            "waypoint",
+            tcp::Mode::ReadWrite,
+            WAYPOINT_MESSAGE.into(),
+        )?;
 
         manager
             .workload_builder("server", DEFAULT_NODE)
@@ -184,6 +194,215 @@ mod namespaced {
             ),
         ]);
         telemetry::testing::assert_contains(want);
+        verify_metrics_compression(&zt).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn double_hbone1() -> anyhow::Result<()> {
+        let mut manager = setup_netns_test!(Shared);
+
+        let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+
+        // Service that resolves to workload with ew gateway
+        // The 8080 port mappings don't actually matter because the
+        // final ztunnel is actually an hbone echo server that doesn't
+        // forward anything.
+        manager
+            .service_builder("remote")
+            .addresses(vec![NetworkAddress {
+                network: strng::EMPTY,
+                address: TEST_VIP.parse::<IpAddr>()?,
+            }])
+            .subject_alt_names(vec!["spiffe://cluster.local/ns/default/sa/echo".into()])
+            .ports(HashMap::from([(8080, 8080)]))
+            .register()
+            .await?;
+
+        // This is the e/w gateway that is supposed to be in the remote cluster/network.
+        let actual_ew_gtw = manager
+            .workload_builder("actual-ew-gtw", "remote-node")
+            .hbone()
+            .network("remote".into())
+            .register()
+            .await?;
+
+        // This is the workload in the local cluster that represents the workloads in the remote cluster.
+        // Its local in the sense that the it shows up in the local cluster's xds, but it
+        // represents workloads in the remote cluster.
+        // Its a little weird because we do give it a namespaced/ip,
+        // but that's because of how the tests infra works.
+        let _local_remote_workload = manager
+            .workload_builder("local-remote-workload", "remote-node")
+            .hbone()
+            .network("remote".into())
+            .network_gateway(GatewayAddress {
+                destination: Destination::Address(NetworkAddress {
+                    network: "remote".into(),
+                    address: actual_ew_gtw.ip(),
+                }),
+                hbone_mtls_port: 15008,
+            })
+            .identity(identity::Identity::Spiffe {
+                trust_domain: "cluster.local".into(),
+                namespace: "default".into(),
+                service_account: "actual-ew-gtw".into(),
+            })
+            .service("default/remote.default.svc.cluster.local", 8080, 8080)
+            .register()
+            .await?;
+        let echo = manager
+            .workload_builder("echo", "remote-node2")
+            .register()
+            .await?;
+
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+
+        let echo_hbone_addr = SocketAddr::new(echo.ip(), 15008);
+
+        // No need to run local_remote_workload, as it doesn't actually exist.
+        run_hbone_server(
+            echo.clone(),
+            "echo",
+            tcp::Mode::ReadWrite,
+            WAYPOINT_MESSAGE.into(),
+        )?;
+        run_hbone_server(
+            actual_ew_gtw.clone(),
+            "actual-ew-gtw",
+            tcp::Mode::Forward(echo_hbone_addr),
+            b"".into(),
+        )?;
+
+        run_tcp_to_hbone_client(
+            client.clone(),
+            manager.resolver(),
+            &format!("{TEST_VIP}:8080"),
+        )?;
+
+        let metrics = [
+            (CONNECTIONS_OPENED, 1),
+            (CONNECTIONS_CLOSED, 1),
+            (BYTES_RECV, REQ_SIZE),
+            (BYTES_SENT, HBONE_REQ_SIZE),
+        ];
+        verify_metrics(&zt, &metrics, &source_labels()).await;
+
+        let sent = format!("{REQ_SIZE}");
+        let recv = format!("{HBONE_REQ_SIZE}");
+        let dst_addr = format!("{}:15008", actual_ew_gtw.ip());
+        let want = HashMap::from([
+            ("scope", "access"),
+            ("src.workload", "client"),
+            ("dst.workload", "echo"),
+            ("dst.hbone_addr", "remote.default.svc.cluster.local:8080"),
+            ("dst.addr", &dst_addr),
+            ("bytes_sent", &sent),
+            ("bytes_recv", &recv),
+            ("direction", "outbound"),
+            ("message", "connection complete"),
+            (
+                "src.identity",
+                "spiffe://cluster.local/ns/default/sa/client",
+            ),
+            ("dst.identity", "spiffe://cluster.local/ns/default/sa/echo"),
+        ]);
+        telemetry::testing::assert_contains(want);
+        verify_metrics_compression(&zt).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn double_hbone2() -> anyhow::Result<()> {
+        let mut manager = setup_netns_test!(Shared);
+
+        let _zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+
+        // Service that resolves to workload with ew gateway that uses service addressing
+        manager
+            .service_builder("remote-svc-gtw")
+            .addresses(vec![NetworkAddress {
+                network: strng::EMPTY,
+                address: TEST_VIP2.parse::<IpAddr>()?,
+            }])
+            .subject_alt_names(vec!["spiffe://cluster.local/ns/default/sa/echo".into()])
+            .ports(HashMap::from([(8080, 8080)]))
+            .register()
+            .await?;
+
+        // Service that resolves to the ew gateway.
+        manager
+            .service_builder("ew-gtw-svc")
+            .addresses(vec![NetworkAddress {
+                network: strng::EMPTY,
+                address: TEST_VIP3.parse::<IpAddr>()?,
+            }])
+            .ports(HashMap::from([(15009u16, 15008u16)]))
+            .register()
+            .await?;
+
+        // This is the e/w gateway that is supposed to be in the remote cluster/network.
+        let actual_ew_gtw = manager
+            .workload_builder("actual-ew-gtw", "remote-node")
+            .hbone()
+            .service(
+                "default/ew-gtw-svc.default.svc.cluster.local",
+                15009u16,
+                15008u16,
+            )
+            .network("remote".into())
+            .register()
+            .await?;
+
+        // Like local_remote_workload, but the network gateway is service addressed
+        let _local_remote_workload_svc_gtw = manager
+            .workload_builder("local-remote-workload-svc-gtw", "remote-node")
+            .hbone()
+            .network("remote".into())
+            .network_gateway(GatewayAddress {
+                destination: Destination::Hostname(NamespacedHostname {
+                    namespace: "default".into(),
+                    hostname: "ew-gtw-svc.default.svc.cluster.local".into(),
+                }),
+                hbone_mtls_port: 15009,
+            })
+            .service(
+                "default/remote-svc-gtw.default.svc.cluster.local",
+                8080,
+                8080,
+            )
+            .register()
+            .await?;
+
+        let echo = manager
+            .workload_builder("echo", "remote-node2")
+            .register()
+            .await?;
+
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+        let echo_addr = SocketAddr::new(echo.ip(), 15008);
+        // No need to run local_remote_workload, as it doesn't actually exist.
+
+        run_hbone_server(echo, "echo", tcp::Mode::ReadWrite, WAYPOINT_MESSAGE.into())?;
+        run_hbone_server(
+            actual_ew_gtw,
+            "actual-ew-gtw",
+            tcp::Mode::Forward(echo_addr),
+            b"".into(),
+        )?;
+
+        run_tcp_to_hbone_client(
+            client.clone(),
+            manager.resolver(),
+            &format!("{TEST_VIP2}:8080"),
+        )?;
+
         Ok(())
     }
 
@@ -195,7 +414,12 @@ mod namespaced {
 
         let waypoint = manager.register_waypoint("waypoint", DEFAULT_NODE).await?;
         let waypoint_ip = waypoint.ip();
-        run_hbone_server(waypoint, "waypoint")?;
+        run_hbone_server(
+            waypoint,
+            "waypoint",
+            tcp::Mode::ReadWrite,
+            WAYPOINT_MESSAGE.into(),
+        )?;
 
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
@@ -247,6 +471,7 @@ mod namespaced {
             ),
         ]);
         telemetry::testing::assert_contains(want);
+        verify_metrics_compression(&zt).await;
         Ok(())
     }
 
@@ -275,7 +500,12 @@ mod namespaced {
             )
             .register()
             .await?;
-        run_hbone_server(waypoint, "waypoint")?;
+        run_hbone_server(
+            waypoint,
+            "waypoint",
+            tcp::Mode::ReadWrite,
+            WAYPOINT_MESSAGE.into(),
+        )?;
 
         manager
             .workload_builder("server", DEFAULT_NODE)
@@ -323,6 +553,7 @@ mod namespaced {
             ),
         ]);
         telemetry::testing::assert_contains(want);
+        verify_metrics_compression(&zt).await;
         Ok(())
     }
 
@@ -338,7 +569,12 @@ mod namespaced {
             .mutate_workload(|w| w.hostname = "waypoint.example.com".into())
             .register()
             .await?;
-        run_hbone_server(waypoint, "waypoint")?;
+        run_hbone_server(
+            waypoint,
+            "waypoint",
+            tcp::Mode::ReadWrite,
+            WAYPOINT_MESSAGE.into(),
+        )?;
 
         manager
             .workload_builder("server", DEFAULT_NODE)
@@ -386,6 +622,7 @@ mod namespaced {
             ),
         ]);
         telemetry::testing::assert_contains(want);
+        verify_metrics_compression(&zt).await;
         Ok(())
     }
 
@@ -618,6 +855,8 @@ mod namespaced {
             ]),
         )
         .await;
+        verify_metrics_compression(&local).await;
+        verify_metrics_compression(&remote).await;
         Ok(())
     }
 
@@ -692,27 +931,12 @@ mod namespaced {
         // Now shutdown the server. In real world, the server app would shutdown, then ztunnel would remove itself.
         // In this test, we will leave the server app running, but shutdown ztunnel.
         manager.delete_workload("server").await.unwrap();
-        // Request should fail now
-        let tx = Arc::new(Mutex::new(tx));
-        #[allow(clippy::await_holding_lock)]
-        assert_eventually(
-            Duration::from_secs(2),
-            || async { tx.lock().unwrap().send_and_wait(()).await.is_err() },
-            true,
-        )
-        .await;
-        // Close the connection
-        drop(tx);
 
-        // Should fail as the last request fails
-        assert!(cjh.join().unwrap().is_err());
-
-        // Now try to connect and make sure it fails
+        // In shared mode, verify that new connections succeed but data transfer fails
         client
             .run_and_wait(move || async move {
                 let mut stream = TcpStream::connect(srv).await.unwrap();
                 // We should be able to connect (since client is running), but not send a request
-
                 const BODY: &[u8] = b"hello world";
                 stream.write_all(BODY).await.unwrap();
                 let mut buf = [0; BODY.len() * 2];
@@ -721,6 +945,16 @@ mod namespaced {
                 Ok(())
             })
             .unwrap();
+
+        // The long running connection should also fail on next attempt
+        let tx_send_result = tx.send_and_wait(()).await;
+        assert!(
+            tx_send_result.is_err(),
+            "long running connection should fail after workload deletion"
+        );
+
+        drop(tx);
+        assert!(cjh.join().unwrap().is_err());
         Ok(())
     }
 
@@ -767,6 +1001,7 @@ mod namespaced {
                     )],
                     ..Default::default()
                 }]]],
+                dry_run: false,
             })
             .await?;
         let _ = manager
@@ -797,7 +1032,7 @@ mod namespaced {
                     identity::Identity::from_str("spiffe://cluster.local/ns/default/sa/server")
                         .unwrap();
                 let cert = zt.cert_manager.fetch_certificate(id).await?;
-                let connector = cert.outbound_connector(vec![dst_id]).unwrap();
+                let connector = cert.outbound_connector(vec![dst_id], None).unwrap();
                 let hbone = SocketAddr::new(srv.ip(), 15008);
                 let tcp_stream = TcpStream::connect(hbone).await.unwrap();
                 let tls_stream = connector.connect(tcp_stream).await.unwrap();
@@ -859,7 +1094,7 @@ mod namespaced {
                     identity::Identity::from_str("spiffe://cluster.local/ns/default/sa/server")
                         .unwrap();
                 let cert = zt.cert_manager.fetch_certificate(id).await?;
-                let connector = cert.outbound_connector(vec![dst_id]).unwrap();
+                let connector = cert.outbound_connector(vec![dst_id], None).unwrap();
                 let tcp_stream = TcpStream::connect(SocketAddr::from((srv.ip(), 15008)))
                     .await
                     .unwrap();
@@ -941,7 +1176,7 @@ mod namespaced {
                     identity::Identity::from_str("spiffe://cluster.local/ns/default/sa/server")
                         .unwrap();
                 let cert = zt.cert_manager.fetch_certificate(id).await?;
-                let connector = cert.outbound_connector(vec![dst_id]).unwrap();
+                let connector = cert.outbound_connector(vec![dst_id], None).unwrap();
                 let tcp_stream = TcpStream::connect(SocketAddr::from((srv.ip(), 15008)))
                     .await
                     .unwrap();
@@ -986,7 +1221,7 @@ mod namespaced {
             vec![
                 (zt, 15001, Request), // Outbound: should be blocked due to recursive call
                 (zt, 15006, Request), // Inbound: should be blocked due to recursive call
-                (zt, 15008, Request), // HBONE: expected TLS, reject
+                (zt, 15008, Request), // HBONE: Connection succeeds (ztunnel listens) but request fails due to TLS
                 // Localhost still get connection established, as ztunnel accepts anything. But they are dropped immediately.
                 (zt, 15080, Request),      // socks5: localhost
                 (zt, 15000, Request),      // admin: localhost
@@ -1018,7 +1253,7 @@ mod namespaced {
                 // Ztunnel doesn't listen on these ports...
                 (zt, 15001, Connection), // Outbound: should be blocked due to recursive call
                 (zt, 15006, Connection), // Inbound: should be blocked due to recursive call
-                (zt, 15008, Connection), // HBONE: expected TLS, reject
+                (zt, 15008, Request), // HBONE: Connection succeeds (ztunnel listens) but request fails due to TLS
                 // Localhost is not accessible
                 (zt, 15080, Connection), // socks5: localhost
                 (zt, 15000, Connection), // admin: localhost
@@ -1095,67 +1330,571 @@ mod namespaced {
         let id1s = id1.to_string();
 
         let ta = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+        let ztunnel_identity_obj = ta.ztunnel_identity.as_ref().unwrap().clone();
+        ta.cert_manager
+            .fetch_certificate(&ztunnel_identity_obj)
+            .await?;
+        let ztunnel_identity_str = ztunnel_identity_obj.to_string();
 
         let check = |want: Vec<String>, help: &str| {
             let cm = ta.cert_manager.clone();
             let help = help.to_string();
+            let mut sorted_want = want.clone();
+            sorted_want.sort();
             async move {
-                // Cert manager is async, so we need to wait
                 let res = check_eventually(
                     Duration::from_secs(2),
-                    || cm.collect_certs(|a, _b| a.to_string()),
-                    want,
+                    || async {
+                        let mut certs = cm.collect_certs(|a, _b| a.to_string()).await;
+                        certs.sort();
+                        certs
+                    },
+                    sorted_want,
                 )
                 .await;
                 assert!(res.is_ok(), "{}: got {:?}", help, res.err().unwrap());
             }
         };
-        check(vec![], "initially empty").await;
+        check(
+            vec![ztunnel_identity_str.clone()],
+            "initially only ztunnel cert",
+        )
+        .await;
+
         manager
             .workload_builder("id1-a-remote-node", REMOTE_NODE)
             .identity(id1.clone())
             .register()
             .await?;
-        check(vec![], "we should not prefetch remote nodes").await;
+        check(
+            vec![ztunnel_identity_str.clone()],
+            "we should not prefetch remote nodes",
+        )
+        .await;
+
         manager
             .workload_builder("id1-a-same-node", DEFAULT_NODE)
             .identity(id1.clone())
             .register()
             .await?;
-        check(vec![id1s.clone()], "we should prefetch our nodes").await;
+        check(
+            vec![ztunnel_identity_str.clone(), id1s.clone()],
+            "we should prefetch our nodes",
+        )
+        .await;
+
         manager
             .workload_builder("id1-b-same-node", DEFAULT_NODE)
             .identity(id1.clone())
             .register()
             .await?;
         check(
-            vec![id1s.clone()],
+            vec![ztunnel_identity_str.clone(), id1s.clone()],
             "multiple of same identity shouldn't do anything",
         )
         .await;
         manager.delete_workload("id1-a-remote-node").await?;
+        // Deleting remote node should not affect local certs if local workloads still exist
         check(
-            vec![id1s.clone()],
+            vec![ztunnel_identity_str.clone(), id1s.clone()],
             "removing remote node shouldn't impact anything",
         )
         .await;
         manager.delete_workload("id1-b-same-node").await?;
+        // Deleting one local node shouldn't impact certs if another local workload still exists
         check(
-            vec![id1s.clone()],
+            vec![ztunnel_identity_str.clone(), id1s.clone()],
             "removing local node shouldn't impact anything if I still have some running",
         )
         .await;
         manager.delete_workload("id1-a-same-node").await?;
-        // TODO: this should be vec![], but our testing setup doesn't exercise the real codepath
+        // After deleting all workloads using sa1, give cert manager time to clean up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // In shared mode, certificates may be kept alive by the inbound listener
+        // for handling inbound connections, even after workload deletion
+        let expected_certs = match manager.mode() {
+            TestMode::Shared => vec![ztunnel_identity_str.clone(), id1s.clone()],
+            TestMode::Dedicated => vec![ztunnel_identity_str.clone()],
+        };
         check(
-            vec![id1s.clone()],
-            "removing final workload should clear things out",
+            expected_certs,
+            "removing final workload should clear certs except those needed by inbound listener",
         )
         .await;
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_hbone_metrics_access() -> Result<(), anyhow::Error> {
+        let mut manager = setup_netns_test!(Shared);
+
+        // Deploy ztunnel for the node
+        let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+        let ztunnel_node_ip = manager.resolve("ztunnel-node")?;
+        // Use the actual metrics address ztunnel is listening on (e.g., [::]:15020)
+        // but combine it with the node IP for the client to target.
+        let target_metrics_addr = SocketAddr::new(ztunnel_node_ip, zt.metrics_address.port());
+        let target_metrics_url = format!("http://{target_metrics_addr}/metrics");
+
+        // Deploy a client workload (simulating Prometheus)
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+
+        let zt_identity_str = zt.ztunnel_identity.as_ref().unwrap().to_string();
+
+        // Client makes a standard HTTP GET request to ztunnel's metrics endpoint
+        // Ztunnel's outbound capture should intercept this, initiate HBONE to its own inbound,
+        // which then proxies to the internal metrics server.
+        client
+            .run(move || async move {
+                info!(target=%target_metrics_url, "Client attempting standard HTTP GET to metrics endpoint");
+
+                let client = hyper_util::client::legacy::Client::builder(
+                    ztunnel::hyper_util::TokioExecutor,
+                )
+                .build_http();
+
+                let req = hyper::Request::builder()
+                    .method(Method::GET)
+                    .uri(&target_metrics_url)
+                    .body(Empty::<Bytes>::new())?;
+
+                let response = client.request(req).await?;
+
+                info!("Received response status: {:?}", response.status());
+                assert_eq!(response.status(), StatusCode::OK, "GET request failed");
+
+                let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+                    .await?
+                    .to_bytes();
+                let response_str = String::from_utf8_lossy(&body_bytes);
+
+                assert!(
+                    response_str.contains("# TYPE"),
+                    "Expected Prometheus metrics (# TYPE) in response, got:\n{response_str}",
+                );
+                info!("Successfully verified metrics response body");
+
+                Ok(())
+            })?
+            .join()
+            .unwrap()?;
+
+        // Verify metrics from the DESTINATION perspective (ztunnel handling its own inbound)
+        let metrics = [
+            (CONNECTIONS_OPENED, 1), // One connection opened (client -> zt inbound via HBONE)
+            (CONNECTIONS_CLOSED, 1), // One connection closed
+        ];
+        verify_metrics(&zt, &metrics, &destination_labels()).await;
+
+        // Verify INBOUND telemetry log for the metrics connection
+        let dst_addr_log = format!("{ztunnel_node_ip}:15008");
+        let dst_hbone_addr_log = format!("{target_metrics_addr}");
+
+        // We don't know exact byte counts, so omit them from the check for now
+        let want = HashMap::from([
+            ("scope", "access"),
+            ("src.workload", "client"),
+            ("dst.workload", "ztunnel-node"), // ztunnel's workload name
+            ("dst.addr", dst_addr_log.as_str()), // Connected to HBONE port
+            ("dst.hbone_addr", dst_hbone_addr_log.as_str()), // Original target
+            ("direction", "inbound"),
+            ("message", "connection complete"), // Assuming success
+            (
+                "src.identity",
+                "spiffe://cluster.local/ns/default/sa/client",
+            ), // Client identity
+            ("dst.identity", zt_identity_str.as_str()), // Ztunnel identity
+        ]);
+        telemetry::testing::assert_contains(want);
+
+        verify_metrics_compression(&zt).await;
+        Ok(())
+    }
+
+    /// Inbound connections must be terminated when CRL revokes cert in chain presented.
+    #[tokio::test]
+    async fn crl_inbound_rejects_revoked_cert() -> anyhow::Result<()> {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+        use ztunnel::tls::mock::crl_pem_revoking_cert;
+
+        let mut manager = setup_netns_test!(Shared);
+
+        // Deploy the local (client-side) ztunnel first so we can access its cert_manager.
+        let local_zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+
+        // The cert the client ztunnel presents to the server during HBONE mTLS is the client
+        // workload's cert.
+        let revoked_cert = local_zt
+            .cert_manager
+            .fetch_certificate(&identity::Identity::from_parts(
+                identity::DEFAULT_TRUST_DOMAIN.into(),
+                "default".into(),
+                "client".into(),
+            ))
+            .await?;
+
+        // Generate a CRL that revokes the client workload's cert by its serial.
+        let crl_pem = crl_pem_revoking_cert(&revoked_cert.cert.serial_bytes());
+        let mut crl_file = NamedTempFile::new()?;
+        crl_file.write_all(crl_pem.as_bytes())?;
+        crl_file.flush()?;
+
+        // Deploy the remote/server-side ztunnel with CRL enforcement enabled so it rejects
+        // the revoked client cert on inbound.
+        let remote_zt = manager
+            .deploy_dedicated_ztunnel(
+                REMOTE_NODE,
+                Some(config::Config {
+                    crl_path: Some(crl_file.path().to_path_buf()),
+                    ..config::parse_config().unwrap()
+                }),
+                None,
+            )
+            .await?;
+
+        run_tcp_server(
+            manager
+                .workload_builder("server", REMOTE_NODE)
+                .hbone()
+                .register()
+                .await?,
+        )?;
+
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+        let srv = resolve_target(manager.resolver(), "server");
+
+        // Run a TCP client expecting the connection to be terminated because the server ztunnel's
+        // inbound CRL check rejects the client cert.
+        client
+            .run(move || async move {
+                info!("Running client (expecting failure) to {srv}");
+                let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(srv))
+                    .await
+                    .context("connect timeout")?
+                    .context("connect failed")?;
+                let mut buf = [0u8; 128];
+                let result = timeout(Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .context("read timeout")?;
+                match result {
+                    Ok(0) | Err(_) => Ok(()), // EOF or IO error: rejected as expected
+                    Ok(n) => anyhow::bail!(
+                        "expected connection failure but received {n} bytes: {:?}",
+                        &buf[..n]
+                    ),
+                }
+            })?
+            .join()
+            .unwrap()?;
+
+        // Verify the server-side ztunnel incremented the CRL rejection counter (reporter=destination).
+        verify_metric_exists(
+            &remote_zt,
+            "istio_crl_policy_rejections_total",
+            &destination_labels(),
+        )
+        .await;
+
+        verify_metrics_compression(&remote_zt).await;
+        Ok(())
+    }
+
+    /// Outbound connections to a workload whose cert is revoked by the CRL must be rejected.
+    #[tokio::test]
+    async fn crl_outbound_rejects_revoked_cert() -> anyhow::Result<()> {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+        use ztunnel::tls::mock::crl_pem_revoking_cert;
+
+        let mut manager = setup_netns_test!(Shared);
+
+        // Deploy the remote (server-side) ztunnel first so we can access its cert_manager.
+        let remote_zt = manager.deploy_ztunnel(REMOTE_NODE).await?;
+
+        // cert the server ztunnel presents to the client ztunnel is the server workload's cert
+        let revoked_cert = remote_zt
+            .cert_manager
+            .fetch_certificate(&identity::Identity::from_parts(
+                identity::DEFAULT_TRUST_DOMAIN.into(),
+                "default".into(),
+                "server".into(),
+            ))
+            .await?;
+
+        // Generate a CRL that revokes the server workload's cert by its serial.
+        let crl_pem = crl_pem_revoking_cert(&revoked_cert.cert.serial_bytes());
+        let mut crl_file = NamedTempFile::new()?;
+        crl_file.write_all(crl_pem.as_bytes())?;
+        crl_file.flush()?;
+
+        // deploy the local/client-side ztunnel with CRL enforcement enabled
+        let local_zt = manager
+            .deploy_dedicated_ztunnel(
+                DEFAULT_NODE,
+                Some(config::Config {
+                    crl_path: Some(crl_file.path().to_path_buf()),
+                    ..config::parse_config().unwrap()
+                }),
+                None,
+            )
+            .await?;
+        run_tcp_server(
+            manager
+                .workload_builder("server", REMOTE_NODE)
+                .hbone()
+                .register()
+                .await?,
+        )?;
+
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+        let srv = resolve_target(manager.resolver(), "server");
+
+        // run a TCP client expecting the connection to be terminated due to the CRL revoking the server workload's cert
+        client
+            .run(move || async move {
+                info!("Running client (expecting failure) to {srv}");
+                // TCP connect to ztunnel's outbound listener succeeds.
+                // ztunnel attempts HBONE/TLS connection upstream.
+                // CRL check should fail the HBONE connection, causing downstream application connection.
+                let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(srv))
+                    .await
+                    .context("connect timeout")?
+                    .context("connect failed")?;
+                let mut buf = [0u8; 128];
+                let result = timeout(Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .context("read timeout")?;
+                match result {
+                    Ok(0) | Err(_) => Ok(()), // EOF or IO error: rejected as expected
+                    Ok(n) => anyhow::bail!(
+                        "expected connection failure but received {n} bytes: {:?}",
+                        &buf[..n]
+                    ),
+                }
+            })?
+            .join()
+            .unwrap()?;
+
+        // Verify the client-side ztunnel incremented the CRL rejection counter.
+        verify_metric_exists(
+            &local_zt,
+            "istio_crl_policy_rejections_total",
+            &source_labels(),
+        )
+        .await;
+
+        verify_metrics_compression(&local_zt).await;
+        Ok(())
+    }
+
+    /// An *already-established* inbound HBONE connection must be abruptly terminated when a CRL
+    /// update (mid-connection) revokes the client workload's certificate, and the server-side
+    /// rejection metric must increment. This exercises existing-connection enforcement, distinct
+    /// from `crl_inbound_rejects_revoked_cert` which only covers rejection at connection open.
+    #[tokio::test]
+    async fn crl_inbound_terminates_existing_connection_on_revocation() -> anyhow::Result<()> {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+        use ztunnel::tls::mock::crl_pem_revoking_cert;
+
+        let mut manager = setup_netns_test!(Shared);
+
+        // deploy the client-side ztunnel first so we can read the client workload cert it presents
+        // to the server during HBONE mTLS, and pre-build the CRL that revokes it.
+        let client_zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+        let revoked_cert = client_zt
+            .cert_manager
+            .fetch_certificate(&identity::Identity::from_parts(
+                identity::DEFAULT_TRUST_DOMAIN.into(),
+                "default".into(),
+                "client".into(),
+            ))
+            .await?;
+        let crl_pem = crl_pem_revoking_cert(&revoked_cert.cert.serial_bytes());
+        // initial crl file is empty so connection is established successfully
+        // we revoke the client cert mid-connection by writing to this file below.
+        let mut crl_file = NamedTempFile::new()?;
+        let crl_path = crl_file.path().to_path_buf();
+
+        let server_zt = manager
+            .deploy_dedicated_ztunnel(
+                REMOTE_NODE,
+                Some(config::Config {
+                    crl_path: Some(crl_path),
+                    ..config::parse_config().unwrap()
+                }),
+                None,
+            )
+            .await?;
+
+        // create server workload requests are sent to and register it
+        run_tcp_server(
+            manager
+                .workload_builder("server", REMOTE_NODE)
+                .hbone()
+                .register()
+                .await?,
+        )?;
+        // create client workload that sends requests and register it
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+        let srv = resolve_target(manager.resolver(), "server");
+
+        // hold a connection open and drive round-trips on demand
+        let (mut tx, rx) = mpsc_ack(1);
+        let client_join_handle = run_long_running_tcp_client(&client, rx, srv)?;
+
+        // initial round-trip succeeds: the connection is established and the cert is not yet revoked
+        info!("initial connection should succeed, CRL is currently empty");
+        tx.send_and_wait(()).await?;
+
+        // revoke client cert by writing the pre-built CRL into the file watched by the server ztunnel
+        info!("revoking client cert and waiting for CRL to update");
+        crl_file.write_all(crl_pem.as_bytes())?;
+        crl_file.flush()?;
+
+        // Eventually (after the CRL file-watcher debounce (~2s) + reload + teardown propagation),
+        // the server ztunnel records the rejection via the existing-connection teardown path
+        // (reporter=destination).
+        info!("verifying CRL metric eventually increments for the existing revoked connection");
+        let metric_labels = destination_labels();
+        assert_eventually(
+            Duration::from_secs(10),
+            || async {
+                server_zt
+                    .metrics()
+                    .await
+                    .unwrap()
+                    .query_sum("istio_crl_policy_rejections_total", &metric_labels)
+                    > 0
+            },
+            true,
+        )
+        .await;
+
+        // ...and the held connection is eventually torn down (a round-trip fails).
+        info!("existing connection should be closed due to detected revoked cert");
+        assert_connection_closed_eventually(&mut tx, Duration::from_secs(10)).await;
+        drop(tx);
+        assert!(client_join_handle.join().unwrap().is_err());
+
+        Ok(())
+    }
+
+    /// An *already-established* outbound HBONE tunnel must be abruptly torn down when a CRL update
+    /// (mid-connection) revokes the upstream server workload's certificate, and the source-side
+    /// rejection metric must increment. This exercises outbound existing-connection enforcement,
+    /// distinct from `crl_outbound_rejects_revoked_cert` which only covers rejection at connection
+    /// open.
+    #[tokio::test]
+    async fn crl_outbound_terminates_existing_connection_on_revocation() -> anyhow::Result<()> {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+        use ztunnel::tls::mock::crl_pem_revoking_cert;
+
+        let mut manager = setup_netns_test!(Shared);
+
+        // deploy the server-side ztunnel first so we can read the server workload cert it presents
+        // to the client during HBONE mTLS, and pre-build the CRL that revokes it.
+        let server_zt = manager.deploy_ztunnel(REMOTE_NODE).await?;
+        let revoked_cert = server_zt
+            .cert_manager
+            .fetch_certificate(&identity::Identity::from_parts(
+                identity::DEFAULT_TRUST_DOMAIN.into(),
+                "default".into(),
+                "server".into(),
+            ))
+            .await?;
+        let crl_pem = crl_pem_revoking_cert(&revoked_cert.cert.serial_bytes());
+        // initial crl file is empty so the connection is established successfully; we revoke the
+        // server cert mid-connection by writing to this file below.
+        let mut crl_file = NamedTempFile::new()?;
+        let crl_path = crl_file.path().to_path_buf();
+
+        // deploy the client-side ztunnel with CRL enforcement enabled
+        let client_zt = manager
+            .deploy_dedicated_ztunnel(
+                DEFAULT_NODE,
+                Some(config::Config {
+                    crl_path: Some(crl_path),
+                    ..config::parse_config().unwrap()
+                }),
+                None,
+            )
+            .await?;
+
+        // create the server workload requests are sent to and register it
+        run_tcp_server(
+            manager
+                .workload_builder("server", REMOTE_NODE)
+                .hbone()
+                .register()
+                .await?,
+        )?;
+        // create the client workload that sends requests and register it
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .register()
+            .await?;
+        let srv = resolve_target(manager.resolver(), "server");
+
+        // hold a connection open and drive round-trips on demand
+        let (mut tx, rx) = mpsc_ack(1);
+        let client_join_handle = run_long_running_tcp_client(&client, rx, srv)?;
+
+        // initial round-trip succeeds: the tunnel is established and the server cert is not yet revoked
+        info!("initial connection should succeed, CRL is currently empty");
+        tx.send_and_wait(()).await?;
+
+        // revoke the server cert by writing the pre-built CRL into the file watched by the client ztunnel
+        info!("revoking server cert and waiting for CRL to update");
+        crl_file.write_all(crl_pem.as_bytes())?;
+        crl_file.flush()?;
+
+        // Eventually (after the CRL file-watcher debounce (~2s) + reload + teardown propagation),
+        // the client ztunnel records the rejection via the existing-connection teardown path
+        // (reporter=source).
+        info!("verifying CRL metric eventually increments for the existing revoked tunnel");
+        let metric_labels = source_labels();
+        assert_eventually(
+            Duration::from_secs(10),
+            || async {
+                client_zt
+                    .metrics()
+                    .await
+                    .unwrap()
+                    .query_sum("istio_crl_policy_rejections_total", &metric_labels)
+                    > 0
+            },
+            true,
+        )
+        .await;
+
+        // ...and the held tunnel is eventually torn down (a round-trip fails).
+        info!("existing connection should be closed due to detected revoked cert");
+        assert_connection_closed_eventually(&mut tx, Duration::from_secs(10)).await;
+        drop(tx);
+        assert!(client_join_handle.join().unwrap().is_err());
+
+        Ok(())
+    }
+
     const TEST_VIP: &str = "10.10.0.1";
+    const TEST_VIP2: &str = "10.10.0.2";
+    const TEST_VIP3: &str = "10.10.0.3";
 
     const SERVER_PORT: u16 = 8080;
     const SERVER_HOSTNAME: &str = "server.default.svc.cluster.local";
@@ -1199,6 +1938,7 @@ mod namespaced {
                 manager
                     .deploy_dedicated_ztunnel(
                         node,
+                        None,
                         Some(WorkloadInfo {
                             name: "client".to_string(),
                             namespace: "default".to_string(),
@@ -1219,6 +1959,7 @@ mod namespaced {
                         manager
                             .deploy_dedicated_ztunnel(
                                 node,
+                                None,
                                 Some(WorkloadInfo {
                                     name: "server".to_string(),
                                     namespace: "default".to_string(),
@@ -1283,6 +2024,7 @@ mod namespaced {
                 want.insert("dst.identity", "");
             }
             telemetry::testing::assert_contains(want);
+            verify_metrics_compression(zt).await;
         }
         if let Some(zt) = client_ztunnel {
             let _remote_metrics = verify_metrics(&zt, &metrics, &source_labels()).await;
@@ -1309,6 +2051,25 @@ mod namespaced {
                 want.insert("dst.identity", "");
             }
             telemetry::testing::assert_contains(want);
+            verify_metrics_compression(&zt).await;
+        }
+    }
+
+    /// Drives round-trips on a held connection until one fails (the connection has been torn down),
+    /// or panics after `dur`. Polling is required because the idle long-running client only observes
+    /// a server-side teardown when it next attempts a round-trip. `send_and_wait` takes `&mut self`,
+    /// so this can't be expressed via the `Fn`-based `assert_eventually` helper.
+    async fn assert_connection_closed_eventually(tx: &mut MpscAckSender<()>, dur: Duration) {
+        let deadline = tokio::time::Instant::now() + dur;
+        loop {
+            if tx.send_and_wait(()).await.is_err() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "held connection was not torn down within {dur:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1337,7 +2098,7 @@ mod namespaced {
             if found {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(i * 10)).await;
+            tokio::time::sleep(Duration::from_millis(i as u64 * 10)).await;
         }
         let metrics = ztunnel.metrics().await.unwrap();
 
@@ -1375,6 +2136,18 @@ mod namespaced {
             labels,
             got.dump()
         );
+    }
+
+    async fn verify_metrics_compression(ztunnel: &TestApp) {
+        let expected = ztunnel.get_metrics("").await.unwrap().len();
+        for encoding in ["gzip", "zstd", "br"] {
+            let actual = ztunnel.get_metrics(encoding).await.unwrap().len();
+            assert_eq!(
+                actual, expected,
+                "decompression mismatch got: {} want: {}",
+                actual, expected
+            );
+        }
     }
 
     fn resolve_target(resolver: Resolver, target: &str) -> SocketAddr {
@@ -1478,10 +2251,15 @@ mod namespaced {
     }
 
     /// run_hbone_server deploys a simple echo server, deployed over HBONE, in the provided namespace
-    fn run_hbone_server(server: Namespace, name: &str) -> anyhow::Result<()> {
+    fn run_hbone_server(
+        server: Namespace,
+        name: &str,
+        mode: tcp::Mode,
+        waypoint_message: Vec<u8>,
+    ) -> anyhow::Result<()> {
         let name = name.to_string();
         server.run_ready(move |ready| async move {
-            let echo = tcp::HboneTestServer::new(tcp::Mode::ReadWrite, &name).await;
+            let echo = tcp::HboneTestServer::new(mode, &name, waypoint_message).await;
             info!("Running hbone echo server at {}", echo.address());
             ready.set_ready();
             echo.run().await;
@@ -1501,7 +2279,6 @@ mod namespaced {
 
     async fn hbone_read_write_stream(stream: &mut TcpStream) {
         const BODY: &[u8] = b"hello world";
-        const WAYPOINT_MESSAGE: &[u8] = b"waypoint\n";
         stream.write_all(BODY).await.unwrap();
         let mut buf = [0; BODY.len() + WAYPOINT_MESSAGE.len()];
         stream.read_exact(&mut buf).await.unwrap();
@@ -1519,7 +2296,6 @@ mod namespaced {
     }
     use Failure::*;
     use ztunnel::state::WorkloadInfo;
-    use ztunnel::state::workload::application_tunnel::Protocol;
 
     async fn malicious_calls_test(
         client: Namespace,
@@ -1546,14 +2322,14 @@ mod namespaced {
                     let stream = timeout(Duration::from_secs(1), TcpStream::connect(tgt)).await?;
                     error!("stream {stream:?}");
                     if failure == Connection {
-                        assert!(stream.is_err());
+                        assert!(stream.is_err(), "expected connection to fail for {tgt}");
                         continue;
                     }
                     let mut stream = stream.unwrap();
 
                     let res = timeout(Duration::from_secs(1), send_traffic(&mut stream)).await?;
                     if failure == Request {
-                        assert!(res.is_err());
+                        assert!(res.is_err(), "expected request to fail for {tgt}");
                         continue;
                     }
                     res.unwrap();
