@@ -303,6 +303,17 @@ impl Service {
         }
     }
 
+    /// Returns true if this is a Kubernetes headless service (no VIP, cluster-local hostname).
+    //
+    // TODO: we should have a reliable way to distinguish these. In sidecars, we use
+    // `svc.Attributes.ServiceRegistry`, but we don't pass anything similar over WDS.
+    // For now, checking the domain is good enough.
+    // This does mean a `.svc.cluster.local` ServiceEntry will use these semantics, but
+    // its better than *ALL* ServiceEntry doing this
+    pub fn is_kubernetes_headless(&self, cluster_local_domain: &str) -> bool {
+        self.vips.is_empty() && self.hostname.ends_with(cluster_local_domain)
+    }
+
     pub fn contains_endpoint(&self, wl: &Workload) -> bool {
         self.endpoints.contains(&wl.uid)
     }
@@ -612,6 +623,19 @@ impl ServiceStore {
         }
     }
 
+    pub fn get_headless_by_host(
+        &self,
+        host: &Strng,
+        cluster_local_domain: &str,
+    ) -> Vec<NamespacedHostname> {
+        self.get_by_host(&strng::new(host))
+            .into_iter()
+            .flat_map(|svcs| svcs.into_iter())
+            .filter(|svc| svc.is_kubernetes_headless(cluster_local_domain))
+            .map(|svc| svc.namespaced_hostname())
+            .collect_vec()
+    }
+
     /// Adds an endpoint for the service VIP.
     /// Applies a batch of endpoint upserts and removals to a single service with
     /// a single clone + single reindex (or a single staged-map update when the
@@ -810,7 +834,7 @@ impl ServiceStore {
     #[cfg(test)]
     pub fn num_services(&self) -> usize {
         let mut count = 0;
-        for (_, value) in self.by_host.iter() {
+        for value in self.by_host.values() {
             count += value.len();
         }
         count
